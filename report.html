@@ -134,7 +134,19 @@ access_key=zstore
 secret_key=zstore</pre>
 <div class="note warn">注意：默认凭据是 <code>rustfsadmin/rustfsadmin</code>，务必覆盖；控制台 9001、API 9000（本机与 moto 共存时用 9100）；客户端若走 virtual-hosted 风格需设 <code>RUSTFS_SERVER_DOMAINS</code>。</div>
 
-<h2>7. 复现步骤</h2>
+<h2>7. 并发、锁与运维闭环（本轮）</h2>
+<table>
+  <tr><th>能力</th><th>实现</th><th>实测</th></tr>
+  <tr><td>提交原子性</td><td><code>revs/&lt;n&gt;</code> 用 <code>If-None-Match: *</code> 抢号；<code>HEAD</code> 用 <code>If-Match: &lt;etag&gt;</code> 更新；基线落后于 HEAD 直接拒绝</td><td>✅ 并发提交只有一个成功，另一个 <code>E160028 transaction base r1 is out of date (HEAD is r2)</code>，数据无丢失</td></tr>
+  <tr><td>锁 lock / unlock / get-locks</td><td><code>locks/&lt;sha256(path)&gt;</code>，字段 path/token/owner/comment/created/expires/dav；创建条件写防重，unlock 校验 token</td><td>✅ <code>svn lock</code>、<code>svn info</code>、<code>unlock --force</code>、<code>svnadmin lslocks</code> 全通</td></tr>
+  <tr><td>hotcopy</td><td>按 db 路径重建双 client，逐对象 <code>x-amz-copy-source</code> 复制；目标自动分配独立前缀并回写 <code>prefix=</code></td><td>✅ 31 对象复制；目标 verify/log/ls 通过并可独立提交 r4，源仓库仍 r3</td></tr>
+  <tr><td>recover</td><td>倒序扫 <code>revs/*</code>，取 root 树存在的最新 revision 重建 HEAD</td><td>✅ 删掉 HEAD 后 <code>recover</code> 恢复到 r4</td></tr>
+  <tr><td>pack</td><td>no-op（对象不可变、内容寻址，天然去重）</td><td>✅ 不报错并打日志</td></tr>
+  <tr><td>open_txn 持久化</td><td>每次变更 checkpoint 到 <code>txns/&lt;id&gt;</code>；提交/abort 删除</td><td>✅ <code>svnadmin lstxns</code>/<code>rmtxns</code> 可列举、可清除</td></tr>
+</table>
+<p>关键坑：<code>fs_library_vtable_t.hotcopy</code> 收到的 src/dst 都是未打开的 <code>fs_new()</code> 壳（<code>fsap_data == NULL</code>）；<code>svn_fs_unlock_many</code> 的 hash value 是裸 token 字符串而不是 <code>svn_fs_lock_target_t*</code>；条件头必须进 SignedHeaders，否则 RustFS 403。</p>
+
+<h2>8. 复现步骤</h2>
 <pre>cd svn-s3 &amp;&amp; zig build            # 产出 zig-out/lib/libsvn_fs_zstore-1.so.0
 
 # subversion trunk（关键开关）
@@ -149,12 +161,12 @@ svn import -m r1 /tmp/imp3 file:///tmp/R
 svn log -v file:///tmp/R
 svn blame file:///tmp/R/trunk/a.txt</pre>
 
-<h2>7. 尚未闭环 & 待决策</h2>
+<h2>9. 尚未闭环 & 待决策</h2>
 <ul>
   <li><strong>真实 S3 选型</strong>：RustFS 1.0.6 已实测跑通（见第 6 节），可作为落地方案；MinIO 开源二进制 <code>dl.min.io</code> 已 410、SeaweedFS release zip 无效。若要上生产，还需评估 RustFS 的运维方式（进程托管、TLS、多盘/多节点）。</li>
-  <li><strong>并发提交原子性</strong>：现在依赖"HEAD 最后写 + 单写者"，没有 conditional PUT / CAS，多客户端同时提交可能丢更新。要补的话，用 S3 的 <code>If-None-Match</code>/版本号或引入轻量锁对象。</li>
-  <li><strong>锁 / hotcopy / recover / pack</strong> 未实现；锁一律返回 UNSUPPORTED，hotcopy 无对象层快照语义。</li>
-  <li><strong>open_txn 未持久化</strong>：进程重启后未提交事务不可恢复（对 svnadmin load 等一次性流程无影响）。</li>
+  <li><strong>三方合并</strong>：当前并发冲突直接拒绝（不丢数据，但 disjoint 路径也需 update 后重试）；后续可把 txn diff 重放到新 HEAD 上做真合并。</li>
+  <li><strong>txn checkpoint 频率</strong>：每次结构变更都 flush + 一次 PUT，大批量 <code>svnadmin load</code> 时可考虑批量/阈值触发。</li>
+  <li><strong>锁过期与 steal</strong>：已存 expires，但未做自动过期清理/抢占。</li>
   <li><strong>内部 txn prop 过滤</strong>：<code>svn:txn-user-agent</code>、<code>svn:txn-client-compat-version</code> 目前会写进 rev 记录与 dump 输出，语义上应过滤。</li>
 </ul>
 

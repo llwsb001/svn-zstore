@@ -369,6 +369,19 @@ pub fn putHead(client: *s3.Client, a: std.mem.Allocator, rev: i64, root: []const
     try client.put("HEAD", text, "text/plain");
 }
 
+pub fn putHeadCond(client: *s3.Client, a: std.mem.Allocator, rev: i64, root: []const u8, cond: s3.Cond) !?[]u8 {
+    const text = try std.fmt.allocPrint(a, "rev={d}\nroot={s}\n", .{ rev, root });
+    defer a.free(text);
+    return client.putCond("HEAD", text, "text/plain", cond);
+}
+
+pub fn headWithEtag(client: *s3.Client, a: std.mem.Allocator) !?struct { head: Head, etag: ?[]u8 } {
+    const res = try client.getWithEtag("HEAD") orelse return null;
+    defer a.free(res.body);
+    const head = try parseHead(a, res.body);
+    return .{ .head = head, .etag = res.etag };
+}
+
 pub fn loadRev(client: *s3.Client, a: std.mem.Allocator, rev: i64) !Rev {
     const key = try std.fmt.allocPrint(a, "revs/{d}", .{rev});
     defer a.free(key);
@@ -384,6 +397,14 @@ pub fn loadRev(client: *s3.Client, a: std.mem.Allocator, rev: i64) !Rev {
     }
     if (out.root.len == 0) return Error.CorruptObject;
     return out;
+}
+
+pub fn putRevCond(client: *s3.Client, a: std.mem.Allocator, rev: Rev, cond: s3.Cond) !?[]u8 {
+    const key = try std.fmt.allocPrint(a, "revs/{d}", .{rev.rev});
+    defer a.free(key);
+    const text = try std.fmt.allocPrint(a, "rev={d}\nparent={d}\nroot={s}\nprops={s}\n", .{ rev.rev, rev.parent, rev.root, rev.props });
+    defer a.free(text);
+    return client.putCond(key, text, "text/plain", cond);
 }
 
 pub fn putRev(client: *s3.Client, a: std.mem.Allocator, rev: Rev) !void {
@@ -477,4 +498,167 @@ test "props codec roundtrip" {
     try std.testing.expectEqual(@as(usize, 2), back.len);
     try std.testing.expectEqualStrings("hello\nworld", back[1].value);
     try std.testing.expectEqualStrings("*", propGet(bytes, "svn:executable").?);
+}
+
+
+// ---------------------------------------------------------------------------
+// transaction records (so an interrupted commit can be reopened)
+// ---------------------------------------------------------------------------
+
+pub const TxnRec = struct {
+    id: []const u8,
+    base: i64 = -1,
+    root: []const u8 = "",
+    props: []const u8 = "",
+};
+
+pub fn txnKey(a: std.mem.Allocator, id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "txns/{s}", .{id});
+}
+
+pub fn putTxn(client: *s3.Client, a: std.mem.Allocator, rec: TxnRec) !void {
+    const key = try txnKey(a, rec.id);
+    defer a.free(key);
+    const text = try std.fmt.allocPrint(a, "txn={s}\nbase={d}\nroot={s}\nprops={s}\n", .{ rec.id, rec.base, rec.root, rec.props });
+    defer a.free(text);
+    try client.put(key, text, "text/plain");
+}
+
+pub fn loadTxn(client: *s3.Client, a: std.mem.Allocator, id: []const u8) !TxnRec {
+    const key = try txnKey(a, id);
+    defer a.free(key);
+    const text = try client.get(key) orelse return Error.NotFound;
+    defer a.free(text);
+    var out = TxnRec{ .id = try a.dupe(u8, id) };
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "base=")) out.base = std.fmt.parseInt(i64, line[5..], 10) catch -1;
+        if (std.mem.startsWith(u8, line, "root=")) out.root = try a.dupe(u8, line[5..]);
+        if (std.mem.startsWith(u8, line, "props=")) out.props = try a.dupe(u8, line[6..]);
+    }
+    return out;
+}
+
+pub fn deleteTxn(client: *s3.Client, a: std.mem.Allocator, id: []const u8) !void {
+    const key = try txnKey(a, id);
+    defer a.free(key);
+    try client.delete(key);
+}
+
+pub fn listTxnIds(client: *s3.Client, a: std.mem.Allocator) ![][]u8 {
+    const keys = try client.listKeys("txns/");
+    defer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    var out = std.ArrayList([]u8).empty;
+    for (keys) |k| {
+        const tail = k[std.mem.lastIndexOfScalar(u8, k, '/') orelse continue ..];
+        if (tail.len <= 1) continue;
+        try out.append(a, try a.dupe(u8, tail[1..]));
+    }
+    return out.toOwnedSlice(a);
+}
+
+// ---------------------------------------------------------------------------
+// locks
+// ---------------------------------------------------------------------------
+
+pub const LockRec = struct {
+    path: []const u8,
+    token: []const u8,
+    owner: []const u8 = "",
+    comment: []const u8 = "",
+    created: i64 = 0,
+    expires: i64 = 0,
+    dav: bool = false,
+};
+
+pub fn lockKey(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(path, &d, .{});
+    return std.fmt.allocPrint(a, "locks/{s}", .{std.fmt.bytesToHex(d, .lower)});
+}
+
+pub fn putLock(client: *s3.Client, a: std.mem.Allocator, rec: LockRec) !void {
+    const key = try lockKey(a, rec.path);
+    defer a.free(key);
+    const text = try std.fmt.allocPrint(a, "path={s}\ntoken={s}\nowner={s}\ncomment={s}\ncreated={d}\nexpires={d}\ndav={d}\n", .{
+        rec.path, rec.token, rec.owner, rec.comment, rec.created, rec.expires, @intFromBool(rec.dav),
+    });
+    defer a.free(text);
+    try client.put(key, text, "text/plain");
+}
+
+pub fn putLockIfAbsent(client: *s3.Client, a: std.mem.Allocator, rec: LockRec) !bool {
+    const key = try lockKey(a, rec.path);
+    defer a.free(key);
+    const text = try std.fmt.allocPrint(a, "path={s}\ntoken={s}\nowner={s}\ncomment={s}\ncreated={d}\nexpires={d}\ndav={d}\n", .{
+        rec.path, rec.token, rec.owner, rec.comment, rec.created, rec.expires, @intFromBool(rec.dav),
+    });
+    defer a.free(text);
+    _ = client.putCond(key, text, "text/plain", .if_absent) catch |e| switch (e) {
+        error.Precondition => return false,
+        else => return e,
+    };
+    return true;
+}
+
+pub fn loadLock(client: *s3.Client, a: std.mem.Allocator, path: []const u8) !?LockRec {
+    const key = try lockKey(a, path);
+    defer a.free(key);
+    const text = try client.get(key) orelse return null;
+    defer a.free(text);
+    var out = LockRec{ .path = try a.dupe(u8, path), .token = "" };
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "token=")) out.token = try a.dupe(u8, line[6..]);
+        if (std.mem.startsWith(u8, line, "owner=")) out.owner = try a.dupe(u8, line[6..]);
+        if (std.mem.startsWith(u8, line, "comment=")) out.comment = try a.dupe(u8, line[8..]);
+        if (std.mem.startsWith(u8, line, "created=")) out.created = std.fmt.parseInt(i64, line[8..], 10) catch 0;
+        if (std.mem.startsWith(u8, line, "expires=")) out.expires = std.fmt.parseInt(i64, line[8..], 10) catch 0;
+        if (std.mem.startsWith(u8, line, "dav=")) out.dav = line[4..].len > 0 and line[4] == '1';
+    }
+    return out;
+}
+
+pub fn deleteLock(client: *s3.Client, a: std.mem.Allocator, path: []const u8) !void {
+    const key = try lockKey(a, path);
+    defer a.free(key);
+    try client.delete(key);
+}
+
+
+pub fn listLocks(client: *s3.Client, a: std.mem.Allocator) ![]LockRec {
+    const keys = try client.listKeys("locks/");
+    defer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    var out = std.ArrayList(LockRec).empty;
+    errdefer out.deinit(a);
+    for (keys) |k| {
+        // listKeys returns keys including the repository prefix, but get()
+        // prepends that prefix itself, so strip it before reading.
+        const pre = client.cfg.prefix;
+        const rel = if (pre.len > 0 and std.mem.startsWith(u8, k, pre) and k.len > pre.len)
+            k[pre.len + 1 ..]
+        else
+            k;
+        const text = (try client.get(rel)) orelse continue;
+        defer a.free(text);
+        var rec = LockRec{ .path = "", .token = "" };
+        var text_it = std.mem.splitScalar(u8, text, '\n');
+        while (text_it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "path=")) rec.path = try a.dupe(u8, line[5..]);
+            if (std.mem.startsWith(u8, line, "token=")) rec.token = try a.dupe(u8, line[6..]);
+            if (std.mem.startsWith(u8, line, "owner=")) rec.owner = try a.dupe(u8, line[6..]);
+            if (std.mem.startsWith(u8, line, "comment=")) rec.comment = try a.dupe(u8, line[8..]);
+            if (std.mem.startsWith(u8, line, "created=")) rec.created = std.fmt.parseInt(i64, line[8..], 10) catch 0;
+            if (std.mem.startsWith(u8, line, "expires=")) rec.expires = std.fmt.parseInt(i64, line[8..], 10) catch 0;
+            if (std.mem.startsWith(u8, line, "dav=")) rec.dav = line[4..].len > 0 and line[4] == '1';
+        }
+        if (rec.path.len > 0) try out.append(a, rec);
+    }
+    return out.toOwnedSlice(a);
 }

@@ -13,6 +13,7 @@
 const std = @import("std");
 const c = @import("svn_bindings.zig");
 const store = @import("store.zig");
+const s3 = @import("s3.zig");
 const fs = @import("fs.zig");
 
 const gpa = std.heap.c_allocator;
@@ -423,32 +424,67 @@ fn fBeginTxn(
         .vtable = &txn_vtable,
         .fsap_data = txn,
     };
+    store.putTxn(&zs.client, gpa, .{ .id = id, .base = base, .root = key, .props = "" }) catch |e|
+        logf("cannot persist new transaction: {s}", .{@errorName(e)});
     txn_p.* = t;
     return noError();
 }
 
 fn fOpenTxn(
-    txn: [*c][*c]c.svn_fs_txn_t,
+    txn_p: [*c][*c]c.svn_fs_txn_t,
     fs_: [*c]c.svn_fs_t,
     name: [*c]const u8,
     pool: ?*c.apr_pool_t,
 ) callconv(.c) [*c]c.svn_error_t {
-    _ = txn;
-    _ = fs_;
-    _ = pool;
-    return err(c.SVN_ERR_UNSUPPORTED_FEATURE, "transactions are not persisted; cannot reopen '{s}'", .{std.mem.span(name)});
+    const zs = ZStore.from(fs_);
+    const id = std.mem.span(name);
+    const rec = store.loadTxn(&zs.client, gpa, id) catch |e| switch (e) {
+        error.NotFound => return err(c.SVN_ERR_FS_NO_SUCH_TRANSACTION, "no such transaction: '{s}'", .{id}),
+        else => return mapErr(e, "cannot load transaction"),
+    };
+
+    const txn = gpa.create(Txn) catch return err(c.SVN_ERR_FS_GENERAL, "out of memory", .{});
+    txn.* = .{
+        .zs = zs,
+        .id = gpa.dupe(u8, id) catch return err(c.SVN_ERR_FS_GENERAL, "out of memory", .{}),
+        .base_rev = rec.base,
+        .root_key = if (rec.root.len > 0) rec.root else
+            (rootKeyForRev(zs, rec.base) catch return err(c.SVN_ERR_FS_GENERAL, "no base revision", .{})),
+        .props = rec.props,
+        .dirs = std.StringHashMap(*store.Tree).init(gpa),
+        .a = gpa,
+    };
+
+    const t: *c.svn_fs_txn_t = @ptrCast(@alignCast(c.apr_pcalloc(pool, @sizeOf(c.svn_fs_txn_t)) orelse
+        return err(c.SVN_ERR_FS_GENERAL, "out of memory", .{})));
+    t.* = .{
+        .fs = fs_,
+        .base_rev = @intCast(rec.base),
+        .id = txn.id.ptr,
+        .vtable = &txn_vtable,
+        .fsap_data = txn,
+    };
+    txn_p.* = t;
+    return noError();
 }
 
 fn fPurgeTxn(fs_: [*c]c.svn_fs_t, txn_id: [*c]const u8, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_error_t {
-    _ = fs_;
-    _ = txn_id;
     _ = pool;
+    const zs = ZStore.from(fs_);
+    store.deleteTxn(&zs.client, gpa, std.mem.span(txn_id)) catch |e| return mapErr(e, "cannot delete transaction");
     return noError();
 }
 
 fn fListTransactions(names_p: [*c][*c]c.apr_array_header_t, fs_: [*c]c.svn_fs_t, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_error_t {
-    _ = fs_;
-    names_p.* = c.apr_array_make(pool, 0, @sizeOf([*c]const u8));
+    const zs = ZStore.from(fs_);
+    const ids = store.listTxnIds(&zs.client, gpa) catch |e| return mapErr(e, "cannot list transactions");
+    defer {
+        for (ids) |id| gpa.free(id);
+        gpa.free(ids);
+    }
+    names_p.* = c.apr_array_make(pool, @intCast(ids.len), @sizeOf([*c]const u8));
+    const elts: [*][*c]const u8 = @ptrCast(@alignCast(names_p.*.*.elts));
+    for (ids, 0..) |id, i| elts[i] = fs.dupFromPool(pool, id).ptr;
     return noError();
 }
 
@@ -463,6 +499,18 @@ fn fNoLocks() [*c]c.svn_error_t {
     return err(c.SVN_ERR_UNSUPPORTED_FEATURE, "locking is not supported by the zstore backend", .{});
 }
 
+fn lockToSvn(rec: store.LockRec, pool: ?*c.apr_pool_t) [*c]c.svn_lock_t {
+    const lk = c.svn_lock_create(pool);
+    lk.*.path = fs.dupFromPool(pool, rec.path).ptr;
+    lk.*.token = fs.dupFromPool(pool, rec.token).ptr;
+    lk.*.owner = fs.dupFromPool(pool, rec.owner).ptr;
+    lk.*.comment = fs.dupFromPool(pool, rec.comment).ptr;
+    lk.*.is_dav_comment = @intFromBool(rec.dav);
+    lk.*.creation_date = rec.created;
+    lk.*.expiration_date = rec.expires;
+    return lk;
+}
+
 fn fLock(
     fs_: [*c]c.svn_fs_t,
     targets: ?*c.apr_hash_t,
@@ -475,17 +523,48 @@ fn fLock(
     result_pool: ?*c.apr_pool_t,
     scratch_pool: ?*c.apr_pool_t,
 ) callconv(.c) [*c]c.svn_error_t {
-    _ = fs_;
-    _ = targets;
-    _ = comment;
-    _ = is_dav_comment;
-    _ = expiration_date;
-    _ = steal_lock;
-    _ = lock_callback;
-    _ = lock_baton;
-    _ = result_pool;
-    _ = scratch_pool;
-    return fNoLocks();
+    if (targets == null) return noError();
+    const zs = ZStore.from(fs_);
+    const a = gpa;
+    const pool = result_pool orelse scratch_pool;
+    var hi = c.apr_hash_first(scratch_pool orelse pool, targets);
+    while (hi != null) : (hi = c.apr_hash_next(hi)) {
+        const path_ptr = c.apr_hash_this_key(hi) orelse continue;
+        const path = std.mem.span(@as([*c]const u8, @ptrCast(path_ptr)));
+        const target: ?*align(1) const c.svn_fs_lock_target_t = if (c.apr_hash_this_val(hi)) |v| @ptrCast(v) else null;
+
+        const existing = store.loadLock(&zs.client, a, path) catch |e| return mapErr(e, "cannot read lock");
+        if (existing != null and steal_lock == 0) {
+            return err(c.SVN_ERR_FS_PATH_ALREADY_LOCKED, "path '{s}' is already locked", .{path});
+        }
+        const token = if (target) |t| (if (t.*.token != null) std.mem.span(t.*.token) else "") else "";
+        var tok_buf: [80]u8 = undefined;
+        const new_token: []const u8 = if (token.len > 0) token else
+            (std.fmt.bufPrint(&tok_buf, "opaquelocktoken:{d}-{d}", .{ std.os.linux.getpid(), c.apr_time_now() }) catch "opaquelocktoken:zstore");
+
+        const rec = store.LockRec{
+            .path = path,
+            .token = new_token,
+            .owner = "",
+            .comment = if (comment != null) std.mem.span(comment) else "",
+            .created = c.apr_time_now(),
+            .expires = expiration_date,
+            .dav = is_dav_comment != 0,
+        };
+        if (steal_lock != 0) {
+            store.putLock(&zs.client, a, rec) catch |e| return mapErr(e, "cannot write lock");
+        } else {
+            const ok = store.putLockIfAbsent(&zs.client, a, rec) catch |e| return mapErr(e, "cannot write lock");
+            if (!ok) return err(c.SVN_ERR_FS_PATH_ALREADY_LOCKED, "path '{s}' is already locked", .{path});
+        }
+
+        if (lock_callback) |cb| {
+            const lk = lockToSvn(rec, pool);
+            const rc = cb(lock_baton, fs.dupFromPool(pool, path).ptr, lk, null, pool);
+            if (rc != null) return rc;
+        }
+    }
+    return noError();
 }
 
 fn fGenerateLockToken(token: [*c][*c]const u8, fs_: [*c]c.svn_fs_t, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_error_t {
@@ -506,22 +585,43 @@ fn fUnlock(
     result_pool: ?*c.apr_pool_t,
     scratch_pool: ?*c.apr_pool_t,
 ) callconv(.c) [*c]c.svn_error_t {
-    _ = fs_;
-    _ = targets;
-    _ = break_lock;
-    _ = lock_callback;
-    _ = lock_baton;
-    _ = result_pool;
-    _ = scratch_pool;
-    return fNoLocks();
+    if (targets == null) return noError();
+    const zs = ZStore.from(fs_);
+    const a = gpa;
+    const pool = result_pool orelse scratch_pool;
+    var hi = c.apr_hash_first(scratch_pool orelse pool, targets);
+    while (hi != null) : (hi = c.apr_hash_next(hi)) {
+        const path_ptr = c.apr_hash_this_key(hi) orelse continue;
+        const path = std.mem.span(@as([*c]const u8, @ptrCast(path_ptr)));
+        // svn_fs_unlock_many hashes path -> token (char *), unlike lock_many
+        // which hashes path -> svn_fs_lock_target_t.
+        const token: []const u8 = if (c.apr_hash_this_val(hi)) |v|
+            std.mem.span(@as([*c]const u8, @ptrCast(v)))
+        else
+            "";
+        const rec = (store.loadLock(&zs.client, a, path) catch |e| return mapErr(e, "cannot read lock")) orelse
+            return err(c.SVN_ERR_FS_NO_SUCH_LOCK, "path '{s}' is not locked", .{path});
+        if (break_lock == 0 and !std.mem.eql(u8, token, rec.token)) {
+            return err(c.SVN_ERR_FS_LOCK_OWNER_MISMATCH, "lock token does not match for '{s}'", .{path});
+        }
+        store.deleteLock(&zs.client, a, path) catch |e| return mapErr(e, "cannot delete lock");
+        if (lock_callback) |cb| {
+            const lk = lockToSvn(rec, pool);
+            const rc = cb(lock_baton, fs.dupFromPool(pool, path).ptr, lk, null, pool);
+            if (rc != null) return rc;
+        }
+    }
+    return noError();
 }
 
 fn fGetLock(lock: [*c][*c]c.svn_lock_t, fs_: [*c]c.svn_fs_t, path: [*c]const u8, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_error_t {
-    _ = lock;
-    _ = fs_;
-    _ = path;
-    _ = pool;
-    return fNoLocks();
+    const zs = ZStore.from(fs_);
+    const norm = normPath(gpa, std.mem.span(path)) catch return err(c.SVN_ERR_FS_GENERAL, "oom", .{});
+    defer gpa.free(norm);
+    const rec = (store.loadLock(&zs.client, gpa, norm) catch |e| return mapErr(e, "cannot read lock")) orelse
+        return err(c.SVN_ERR_FS_NO_SUCH_LOCK, "path '{s}' is not locked", .{norm});
+    lock.* = lockToSvn(rec, pool);
+    return noError();
 }
 
 fn fGetLocks(
@@ -532,12 +632,30 @@ fn fGetLocks(
     get_locks_baton: ?*anyopaque,
     pool: ?*c.apr_pool_t,
 ) callconv(.c) [*c]c.svn_error_t {
-    _ = fs_;
-    _ = path;
-    _ = depth;
-    _ = get_locks_func;
-    _ = get_locks_baton;
-    _ = pool;
+    const zs = ZStore.from(fs_);
+    const base = normPath(gpa, std.mem.span(path)) catch return err(c.SVN_ERR_FS_GENERAL, "oom", .{});
+    defer gpa.free(base);
+    const all = store.listLocks(&zs.client, gpa) catch |e| return mapErr(e, "cannot list locks");
+    defer {
+        for (all) |rec| gpa.free(rec.path);
+        gpa.free(all);
+    }
+    for (all) |rec| {
+        const match = if (depth == c.svn_depth_infinity)
+            std.mem.startsWith(u8, rec.path, base)
+        else if (depth == c.svn_depth_immediates) blk: {
+            if (!std.mem.startsWith(u8, rec.path, base) or std.mem.eql(u8, rec.path, base)) break :blk false;
+            const rest = rec.path[base.len..];
+            const trimmed = std.mem.trimStart(u8, rest, "/");
+            break :blk std.mem.indexOfScalar(u8, trimmed, '/') == null;
+        } else std.mem.eql(u8, rec.path, base);
+        if (!match) continue;
+        if (get_locks_func) |cb| {
+            const lk = lockToSvn(rec, pool);
+            const rc = cb(get_locks_baton, lk, pool);
+            if (rc != null) return rc;
+        }
+    }
     return noError();
 }
 
@@ -684,25 +802,76 @@ fn tCommit(
         props_key = store.putBlob(&zs.client, gpa, t.props) catch |e| return mapErr(e, "cannot store revprops");
     }
 
-    const new_rev: i64 = @intCast(youngestRev(zs) catch |e| return mapErr(e, "cannot read HEAD"));
-    store.putRev(&zs.client, gpa, .{
-        .rev = new_rev + 1,
-        .parent = t.base_rev,
-        .root = root_key,
-        .props = props_key,
-    }) catch |e| return mapErr(e, "cannot write revision record");
-    store.putHead(&zs.client, gpa, new_rev + 1, root_key) catch |e| return mapErr(e, "cannot update HEAD");
+    // Concurrency: HEAD is the single source of truth and every write to it
+    // carries a precondition, so two committers cannot both claim a revision.
+    // Trees and blobs are content-addressed and idempotent, so retries only
+    // re-upload what they already produced.
+    var attempt: usize = 0;
+    var committed: i64 = -1;
+    while (attempt < 32) : (attempt += 1) {
+        var head_rev: i64 = -1;
+        var head_etag: ?[]u8 = null;
+        if (store.headWithEtag(&zs.client, gpa) catch |e| return mapErr(e, "cannot read HEAD")) |hw| {
+            head_rev = hw.head.rev;
+            head_etag = hw.etag;
+        }
+        defer if (head_etag) |e| gpa.free(e);
+        // Refuse to build a revision on a base that is no longer HEAD: without
+        // a three-way merge that would silently drop the winner's changes.
+        if (t.base_rev != head_rev) {
+            return err(c.SVN_ERR_FS_TXN_OUT_OF_DATE, "transaction base r{d} is out of date (HEAD is r{d})", .{ t.base_rev, head_rev });
+        }
+        const new_rev = head_rev + 1;
 
-    zs.youngest = new_rev + 1;
-    new_rev_p.* = @intCast(new_rev + 1);
+        const rev_cond: s3.Cond = .if_absent;
+        const rev_etag: ?[]u8 = store.putRevCond(&zs.client, gpa, .{
+            .rev = new_rev,
+            .parent = t.base_rev,
+            .root = root_key,
+            .props = props_key,
+        }, rev_cond) catch |e| switch (e) {
+            // Another writer already published this revision number; just
+            // retry from the freshly read HEAD.
+            error.Precondition => continue,
+            else => return mapErr(e, "cannot write revision record"),
+        };
+        if (rev_etag) |etag| gpa.free(etag);
+
+        const head_cond: s3.Cond = if (head_etag) |etag| .{ .if_match = etag } else .if_absent;
+        const new_head_etag: ?[]u8 = store.putHeadCond(&zs.client, gpa, new_rev, root_key, head_cond) catch |e| switch (e) {
+            error.Precondition => {
+                // Lost the race.  Head moved while this transaction was open,
+                // so committing it as-is would silently overwrite whatever the
+                // winner wrote.  Drop our revision record and tell the client
+                // the transaction is out of date (it can update and retry).
+                const key = std.fmt.allocPrint(gpa, "revs/{d}", .{new_rev}) catch "";
+                defer if (key.len > 0) gpa.free(key);
+                if (key.len > 0) zs.client.delete(key) catch {};
+                return err(c.SVN_ERR_FS_TXN_OUT_OF_DATE, "transaction base r{d} is out of date (HEAD moved to r{d})", .{ t.base_rev, head_rev });
+            },
+            else => return mapErr(e, "cannot update HEAD"),
+        };
+        if (new_head_etag) |etag| gpa.free(etag);
+
+        committed = new_rev;
+        break;
+    }
+    if (committed < 0) return err(c.SVN_ERR_FS_GENERAL, "commit aborted: HEAD kept moving, giving up after retries", .{});
+    const new_rev = committed;
+    store.deleteTxn(&zs.client, gpa, t.id) catch |e|
+        logf("cannot delete committed transaction record: {s}", .{@errorName(e)});
+    zs.youngest = new_rev;
+    new_rev_p.* = @intCast(new_rev);
     conflict_p.* = null;
-    logf("committed r{d} (root {s})", .{ new_rev + 1, root_key[0..@min(root_key.len, 12)] });
+    logf("committed r{d} (root {s})", .{ new_rev, root_key[0..@min(root_key.len, 12)] });
     return noError();
 }
 
 fn tAbort(txn: [*c]c.svn_fs_txn_t, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_error_t {
-    _ = txn;
     _ = pool;
+    const t = txnOf(txn);
+    store.deleteTxn(&t.zs.client, gpa, t.id) catch |e|
+        logf("cannot delete transaction record: {s}", .{@errorName(e)});
     return noError();
 }
 
@@ -737,6 +906,7 @@ fn tChangeProp(
     const t = txnOf(txn);
     const v: ?[]const u8 = if (value == null) null else value.*.data[0..value.*.len];
     t.props = propsSet(gpa, t.props, std.mem.span(name), v) catch |e| return mapErr(e, "cannot update txn properties");
+    store.putTxn(&t.zs.client, gpa, .{ .id = t.id, .base = t.base_rev, .root = t.root_key, .props = t.props }) catch {};
     return noError();
 }
 
@@ -1158,6 +1328,7 @@ fn closeWriteCb(baton: ?*anyopaque) callconv(.c) [*c]c.svn_error_t {
     e.key = sha;
     e.size = @intCast(wc.buf.items.len);
     loc.tree.dirty = true;
+    checkpoint(wc.ctx);
     return noError();
 }
 
@@ -1269,6 +1440,21 @@ fn txnOnlyErr() [*c]c.svn_error_t {
     return err(c.SVN_ERR_FS_GENERAL, "cannot modify a revision root", .{});
 }
 
+fn checkpoint(ctx: *Ctx) void {
+    // Persist the transaction after every mutation so an interrupted commit
+    // (server crash, dropped connection) can be reopened by svnadmin.
+    const t = ctx.txn orelse return;
+    if (ctx.rev != t.base_rev) return;
+    const root_tree = treeAt(ctx, "/") catch return;
+    const key = flushDir(ctx, "/", root_tree) catch |e| {
+        logf("txn checkpoint failed to flush: {s}", .{@errorName(e)});
+        return;
+    };
+    store.putTxn(&t.zs.client, gpa, .{ .id = t.id, .base = t.base_rev, .root = key, .props = t.props }) catch |e| {
+        logf("txn checkpoint failed to persist: {s}", .{@errorName(e)});
+    };
+}
+
 fn rMakeDir(root: [*c]c.svn_fs_root_t, path: [*c]const u8, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_error_t {
     _ = pool;
     const ctx = ctxOf(root);
@@ -1276,6 +1462,7 @@ fn rMakeDir(root: [*c]c.svn_fs_root_t, path: [*c]const u8, pool: ?*c.apr_pool_t)
     const norm = normPath(gpa, std.mem.span(path)) catch return err(c.SVN_ERR_FS_GENERAL, "oom", .{});
     defer gpa.free(norm);
     addNode(ctx, norm, .dir) catch |e| return mapErr(e, "cannot create directory");
+    checkpoint(ctx);
     return noError();
 }
 
@@ -1290,6 +1477,7 @@ fn rMakeFile(root: [*c]c.svn_fs_root_t, path: [*c]const u8, pool: ?*c.apr_pool_t
         return noError();
     }
     addNode(ctx, norm, .file) catch |e| return mapErr(e, "cannot create file");
+    checkpoint(ctx);
     return noError();
 }
 
@@ -1303,7 +1491,10 @@ fn addNode(ctx: *Ctx, norm: []const u8, kind: store.Kind) !void {
         .kind = kind,
         .key = "",
         .size = 0,
-        .created_rev = -1,
+        // The commit that creates this node is txn base + 1; without a real
+        // value here the loader would report every node as created in HEAD,
+        // and svn's out-of-date checks would reject disjoint commits.
+        .created_rev = ctx.rev + 1,
         .created_path = try ctx.a.dupe(u8, norm),
         .props = "",
         .copyfrom_rev = -1,
@@ -1339,6 +1530,7 @@ fn rDeleteNode(root: [*c]c.svn_fs_root_t, path: [*c]const u8, pool: ?*c.apr_pool
     if (!parent.remove(baseName(norm))) return err(c.SVN_ERR_FS_NOT_FOUND, "path '{s}' not found", .{norm});
     parent.dirty = true;
     discardSubtree(ctx, norm);
+    checkpoint(ctx);
     return noError();
 }
 
@@ -1354,6 +1546,7 @@ fn rChangeNodeProp(root: [*c]c.svn_fs_root_t, path: [*c]const u8, name: [*c]cons
     const v: ?[]const u8 = if (value == null) null else value.*.data[0..value.*.len];
     e.props = propsSet(gpa, e.props, std.mem.span(name), v) catch |x| return mapErr(x, "cannot update properties");
     loc.tree.dirty = true;
+    checkpoint(ctx);
     return noError();
 }
 
@@ -1371,7 +1564,7 @@ fn copyNode(ctx: *Ctx, from_root: [*c]c.svn_fs_root_t, from_norm: []const u8, to
         .kind = src.kind,
         .key = try ctx.a.dupe(u8, src.key),
         .size = src.size,
-        .created_rev = @intCast(ctx.rev),
+        .created_rev = ctx.rev + 1,
         .created_path = try ctx.a.dupe(u8, to_norm),
         .props = try ctx.a.dupe(u8, src.props),
         .copyfrom_rev = created_rev,
@@ -1396,6 +1589,7 @@ fn rCopy(
     const to_norm = normPath(gpa, std.mem.span(to_path)) catch return err(c.SVN_ERR_FS_GENERAL, "oom", .{});
     defer gpa.free(to_norm);
     copyNode(to_ctx, from_root, from_norm, to_norm) catch |e| return mapErr(e, "cannot copy node");
+    checkpoint(to_ctx);
     return noError();
 }
 
@@ -1412,6 +1606,7 @@ fn rRevisionLink(from_root: [*c]c.svn_fs_root_t, to_root: [*c]c.svn_fs_root_t, p
     parent.entries.items[idx].key = src.key;
     parent.entries.items[idx].size = src.size;
     parent.dirty = true;
+    checkpoint(to_ctx);
     return noError();
 }
 

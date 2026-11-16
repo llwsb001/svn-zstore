@@ -41,7 +41,8 @@ Zig 0.17 已移除 `@cImport`，因此绑定全部由 `zig translate-c` 生成�
   `str` = `u32 BE len + bytes`
 - props 编码：`u32 BE count + (name,value)*`，解码后字符串必须 NUL 结尾（apr hash key 与 `svnadmin dump` 都用 C 字符串）
 
-`HEAD` 最后写，单写者假设；暂无 CAS，多写并发提交不保证。
+`HEAD` 用条件写（ETag + `If-Match`）更新，revision 号用 `If-None-Match: *` 抢占；
+事务基线不等于 HEAD 时提交被拒（`E160028`），不会静默覆盖别人的提交。
 
 ## 构建与运行
 
@@ -82,8 +83,11 @@ svn co file:///tmp/R /tmp/wcR
 | `svnadmin verify` | ✅ |
 | `svnadmin dump` / `load` | ✅ 往返一致（含 changed paths） |
 | `svn://`（svnserve）：ls / co / ci / blame | ✅ |
-| 锁 / hotcopy / recover / pack | ❌ 未实现（锁返回 UNSUPPORTED） |
-| 事务持久化 `open_txn` | ❌ 返回 UNSUPPORTED（事务仅内存态） |
+| 锁（lock/unlock/get-locks）| ✅ 对象存 `locks/<sha256(path)>`，含 token / 注释 / 过期时间 |
+| `svnadmin hotcopy` | ✅ 服务端 CopyObject 复制前缀，目标自动分配独立前缀并写入 `prefix=` |
+| `svnadmin recover` | ✅ 列举 `revs/*` 取最大可用 revision 并重建 `HEAD` |
+| `svnadmin pack` | ✅ no-op（内容寻址天然去重，无碎片可合） |
+| 事务 `txns` | ✅ 每次修改 checkpoint 到 `txns/<id>`；`svnadmin lstxns` / `rmtxns` 可用，崩溃后可重开 |
 
 ## 调试期踩过的主要坑（保留备查）
 
@@ -152,3 +156,30 @@ secret_key=zstore
 - mock：`pip install "moto[server]"`，`moto_server -p 9000 -H 127.0.0.1`，bucket `svn`（内存态）
 - 真实候选：RustFS 1.0.6（已在 `/home/user/tools/rustfs/`，端口 9100，数据在 `/tmp/rustfs-data`）
 - MinIO 官方二进制 `dl.min.io` 已 410、SeaweedFS release zip 无效
+
+## 并发、锁与运维（本轮新增）
+
+**提交原子性**：`revs/<n>` 用 `If-None-Match: *` 抢号，`HEAD` 用 `If-Match: <etag>` 更新；
+抢号失败或被别人先更新 HEAD 时不重试覆盖，而是回滚刚写的 `revs/<n>` 并返回
+`E160028 transaction base rN is out of date (HEAD is rM)`。因此多客户端并发提交**不会丢更新**，
+语义等价于 FSFS 的冲突拒绝（尚未做三方合并，disjoint 路径的并发提交也需要 update 后重试）。
+
+**锁**：`locks/<sha256(path)>` 单对象保存 `path/token/owner/comment/created/expires/dav`；
+创建用条件写防重复，`unlock` 校验 token（`--force` 走 break）；`svnadmin lslocks` 与
+`svn info` 均验证通过（file:// 与 svn:// 均可，svn:// 需 `anon-access=write`）。
+
+**hotcopy**：`fs_library_vtable_t.hotcopy` 拿到的 src/dst 都是未打开的 `fs_new()` 壳，
+因此按 `db` 路径重建两个 S3 client；逐对象 `x-amz-copy-source` 服务端复制。
+repos 层会复制 `db/uuid`，两边同 uuid 会撞 key，故目标自动分配
+`<src-prefix>-hotcopy-<ts>` 并写回 `db/zstore.conf` 的 `prefix=`。实测 31 对象、
+目标仓库 `verify`/`log`/`ls` 与独立提交（r4）均通过，源仓库仍停在 r3。
+
+**recover**：`HEAD` 缺失或指向不存在/不可用的 `trees/<sha>` 时，倒序扫描 `revs/*`
+取第一个 root 树存在的 revision 重写 `HEAD`。实测删掉 `HEAD` 后 `recover` 恢复 r4。
+
+**pack**：对象不可变且按内容寻址（同目录/同内容共享 key），没有需要合并的碎片，
+返回 no-op 并打日志。
+
+**事务持久化**：`fBeginTxn` 写 `txns/<id>`，每次结构变更（建/删/拷/改属性/写文本）
+打 checkpoint（flush 根树 + 更新 txn 记录）；提交成功或 abort 时删除记录。
+已用 `svnadmin lstxns` / `rmtxns` 验证列举与清除（伪造 `txns/ztest-1` 可被列出并删除）。

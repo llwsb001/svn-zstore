@@ -190,6 +190,18 @@ fn cgetenv(name: [*c]const u8) ?[]const u8 {
     return p[0..i];
 }
 
+fn appendConfLine(db_path: []const u8, key: []const u8, val: []const u8) !void {
+    const path = try joinPath(gpa, &.{ db_path, "zstore.conf" });
+    defer gpa.free(path);
+    var buf: [1200]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0);
+    const f = fopen(z.ptr, "a") orelse return error.FileNotFound;
+    defer _ = fclose(f);
+    var line: [600]u8 = undefined;
+    const txt = try std.fmt.bufPrint(&line, "\n{s} = {s}\n", .{ key, val });
+    _ = fwrite(txt.ptr, 1, txt.len, f);
+}
+
 fn loadConf(a: std.mem.Allocator, db_path: []const u8) !RepoConf {
     var conf = RepoConf{
         .endpoint = envOr("ENDPOINT", "http://127.0.0.1:9000"),
@@ -414,6 +426,36 @@ fn fsDeleteFs(path: [*c]const u8, pool: ?*c.apr_pool_t) callconv(.c) [*c]c.svn_e
     return noError();
 }
 
+const HotRepo = struct { client: s3.Client, prefix: []const u8 };
+
+fn writeFileText(path: []const u8, text: []const u8) !void {
+    var buf: [1200]u8 = undefined;
+    const z = try std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0);
+    const f = fopen(z.ptr, "wb") orelse return error.FileNotFound;
+    defer _ = fclose(f);
+    if (text.len > 0) _ = fwrite(text.ptr, 1, text.len, f);
+}
+
+fn repoClient(db_path: []const u8) !HotRepo {
+    const conf = loadConf(gpa, db_path) catch RepoConf{};
+    var prefix = conf.prefix;
+    if (prefix.len == 0) {
+        const uuid_path = try joinPath(gpa, &.{ db_path, "uuid" });
+        defer gpa.free(uuid_path);
+        const txt = readFileAlloc(uuid_path) catch "";
+        prefix = std.mem.trim(u8, txt, " \t\r\n");
+    }
+    const client = try s3.Client.init(gpa, .{
+        .endpoint = conf.endpoint,
+        .region = conf.region,
+        .bucket = conf.bucket,
+        .access_key = conf.access_key,
+        .secret_key = conf.secret_key,
+        .prefix = prefix,
+    });
+    return .{ .client = client, .prefix = prefix };
+}
+
 fn fsHotcopy(
     src_fs: [*c]c.svn_fs_t,
     dst_fs: [*c]c.svn_fs_t,
@@ -429,20 +471,83 @@ fn fsHotcopy(
     pool: ?*c.apr_pool_t,
     common_pool: ?*c.apr_pool_t,
 ) callconv(.c) [*c]c.svn_error_t {
-    _ = src_fs;
+    _ = src_fs; // fs-loader hands us bare, unopened svn_fs_t stubs
     _ = dst_fs;
-    _ = src_path;
-    _ = dst_path;
     _ = clean;
-    _ = incremental;
     _ = notify_func;
     _ = notify_baton;
-    _ = cancel_func;
-    _ = cancel_baton;
     _ = common_pool_lock;
     _ = pool;
     _ = common_pool;
-    return err(c.SVN_ERR_FS_UNSUPPORTED_FORMAT, "hotcopy is not supported by the zstore backend", .{});
+
+    // Both filesystems arrive as fs_new() stubs holding no fsap_data, so the
+    // object stores must be reconstructed from the two db directories.
+    // The destination db may still be empty: seed its configuration from the
+    // source so it points at the same endpoint/bucket.
+    {
+        const dst_conf = joinPath(gpa, &.{ std.mem.span(dst_path), "zstore.conf" }) catch "";
+        defer if (dst_conf.len > 0) gpa.free(dst_conf);
+        if (dst_conf.len > 0 and (readFileAlloc(dst_conf) catch null) == null) {
+            const src_conf = joinPath(gpa, &.{ std.mem.span(src_path), "zstore.conf" }) catch "";
+            defer if (src_conf.len > 0) gpa.free(src_conf);
+            if (src_conf.len > 0) {
+                if (readFileAlloc(src_conf) catch null) |text| {
+                    writeFileText(dst_conf, text) catch {};
+                }
+            }
+        }
+    }
+    var src = repoClient(std.mem.span(src_path)) catch
+        return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot initialise source client", .{});
+    var dst = repoClient(std.mem.span(dst_path)) catch
+        return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot initialise destination client", .{});
+
+    if (dst.prefix.len == 0 or std.mem.eql(u8, src.prefix, dst.prefix)) {
+        // repos hotcopy copies db/uuid, so both sides would otherwise share
+        // one key space; give the destination its own, and persist it.
+        const tail = std.fmt.allocPrint(gpa, "-hotcopy-{d}", .{c.apr_time_now()}) catch
+            return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot derive destination prefix", .{});
+        defer gpa.free(tail);
+        const base = if (src.prefix.len > 0) src.prefix else "repo";
+        const new_prefix = std.fmt.allocPrint(gpa, "{s}{s}", .{ base, tail }) catch
+            return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot derive destination prefix", .{});
+        appendConfLine(std.mem.span(dst_path), "prefix", new_prefix) catch |e|
+            logf("hotcopy: cannot persist destination prefix: {s}", .{@errorName(e)});
+        dst = repoClient(std.mem.span(dst_path)) catch
+            return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot reopen destination client", .{});
+    }
+
+    const keys = src.client.listKeys("") catch |e| return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot list source objects: {s}", .{@errorName(e)});
+    defer {
+        for (keys) |k| gpa.free(k);
+        gpa.free(keys);
+    }
+    var copied: usize = 0;
+    var skipped: usize = 0;
+    for (keys) |full| {
+        if (cancel_func) |cf| {
+            if (cf(cancel_baton) != null) return err(c.SVN_ERR_CANCELLED, "hotcopy cancelled", .{});
+        }
+        if (src.prefix.len > 0) {
+            if (!std.mem.startsWith(u8, full, src.prefix) or full.len <= src.prefix.len) continue;
+        }
+        const tail = if (src.prefix.len > 0) full[src.prefix.len + 1 ..] else full;
+
+        if (incremental != 0) {
+            const have = dst.client.headEtag(tail) catch null;
+            if (have != null) {
+                gpa.free(have.?);
+                skipped += 1;
+                continue;
+            }
+        }
+        const src_path_full = src.client.bucketPath(tail, true) catch |e| return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot build source path: {s}", .{@errorName(e)});
+        defer gpa.free(src_path_full);
+        dst.client.copyFromPath(tail, src_path_full) catch |e| return err(c.SVN_ERR_FS_GENERAL, "hotcopy: cannot copy object: {s}", .{@errorName(e)});
+        copied += 1;
+    }
+    logf("hotcopy: copied {d} objects, skipped {d}", .{ copied, skipped });
+    return noError();
 }
 
 fn fsRecover(
@@ -451,10 +556,49 @@ fn fsRecover(
     cancel_baton: ?*anyopaque,
     pool: ?*c.apr_pool_t,
 ) callconv(.c) [*c]c.svn_error_t {
-    _ = fs;
     _ = cancel_func;
     _ = cancel_baton;
     _ = pool;
+    const zs = ZStore.from(fs);
+
+    // Rebuild HEAD from what is actually in the bucket: revision records are
+    // written before HEAD, so an interrupted commit leaves either a stale
+    // HEAD or a HEAD that points at a revision whose root tree never landed.
+    const ids = zs.client.listKeys("revs/") catch |e| return err(c.SVN_ERR_FS_CORRUPT, "recover: cannot list revisions: {s}", .{@errorName(e)});
+    defer {
+        for (ids) |k| gpa.free(k);
+        gpa.free(ids);
+    }
+    var max_rev: i64 = -1;
+    for (ids) |k| {
+        const slash = std.mem.lastIndexOfScalar(u8, k, '/') orelse continue;
+        const n = std.fmt.parseInt(i64, k[slash + 1 ..], 10) catch continue;
+        if (n > max_rev) max_rev = n;
+    }
+    if (max_rev < 0) return noError(); // empty repository
+
+    var best: i64 = -1;
+    var best_root: []const u8 = "";
+    var rev = max_rev;
+    while (rev >= 0) : (rev -= 1) {
+        const rec = store.loadRev(&zs.client, gpa, rev) catch continue;
+        const probe_key = std.fmt.allocPrint(gpa, "trees/{s}", .{rec.root}) catch continue;
+        defer gpa.free(probe_key);
+        const probe = zs.client.headEtag(probe_key) catch null;
+        if (probe == null) continue; // tree object missing: revision is unusable
+        gpa.free(probe.?);
+        best = rev;
+        best_root = rec.root;
+        break;
+    }
+    if (best < 0) return err(c.SVN_ERR_FS_CORRUPT, "recover: no usable revision found", .{});
+
+    const head = store.loadHead(&zs.client, gpa) catch return err(c.SVN_ERR_FS_CORRUPT, "recover: cannot read HEAD", .{});
+    if (head.rev != best or !std.mem.eql(u8, head.root, best_root)) {
+        logf("recover: HEAD r{d} -> r{d}", .{ head.rev, best });
+        store.putHead(&zs.client, gpa, best, best_root) catch |e| return err(c.SVN_ERR_FS_CORRUPT, "recover: cannot rewrite HEAD: {s}", .{@errorName(e)});
+    }
+    zs.youngest = best;
     return noError();
 }
 
@@ -478,6 +622,9 @@ fn fsPack(
     _ = common_pool_lock;
     _ = pool;
     _ = common_pool;
+    // Trees and blobs are immutable and content addressed, so identical
+    // objects already share one key: there is nothing to coalesce.
+    logf("pack: no-op (content addressed objects are already deduplicated)", .{});
     return noError();
 }
 
