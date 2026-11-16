@@ -194,8 +194,23 @@ repos 层会复制 `db/uuid`，两边同 uuid 会撞 key，故目标自动分配
 **pack**：对象不可变且按内容寻址（同目录/同内容共享 key），没有需要合并的碎片，
 返回 no-op 并打日志。
 
-**事务持久化**：`fBeginTxn` 写 `txns/<id>`，每次结构变更（建/删/拷/改属性/写文本）
-打 checkpoint（flush 根树 + 更新 txn 记录）；提交成功或 abort 时删除记录。
+**事务持久化**：`fBeginTxn` 写 `txns/<id>`，结构变更（建/删/拷/改属性/写文本）按批
+打 checkpoint（flush 根树 + 更新 txn 记录）；提交成功或 abort 时删除记录。默认每 8 次
+变更落一次（`ZSTORE_TXN_CHECKPOINT_EVERY` 可调），代价是崩溃时最多丢最近几条未落盘的
+编辑，提交路径始终先 flush 再写 `revs/<n>`，已提交数据不受影响。
+
+批量导入实测（120 revision / 240 个文件改动，dump 78 KB，RustFS 本地）：
+
+| checkpoint 频率 | `svnadmin load` 耗时 |
+|---|---|
+| 每次变更（旧行为，=1） | 9.03 s / 9.13 s |
+| 每 8 次（新默认） | 6.59 s / 6.61 s（−27%） |
+| 每 32 次 | 6.46 s / 6.59 s |
+| 基本不落盘（1000） | 6.62 s |
+
+再往上加没有收益：剩余时间花在每对象一次 HTTP（blob / tree / `revs/<n>` / `HEAD`），
+不是 checkpoint。回归：`verify` 全 120 rev、`log`、`blame`、`dump` 字节数一致、
+`hotcopy`（968 对象）后再 `verify`、`lstxns` 为空。
 已用 `svnadmin lstxns` / `rmtxns` 验证列举与清除（伪造 `txns/ztest-1` 可被列出并删除）。
 
 **created_rev 修复**：提交时必须把本 revision 改动的节点 `created_rev` 记为 `new_rev`

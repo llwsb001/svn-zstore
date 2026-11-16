@@ -167,7 +167,7 @@ svn blame file:///tmp/R/trunk/a.txt</pre>
   <li><strong>三方合并（已完成）</strong>：txn 打开后 HEAD 前进时，把 txn 相对 base 的改动重放到新 HEAD（<code>rebaseOntoTxnHead</code>）；同一路径两边都改且结果不同才判 <code>SVN_ERR_FS_TXN_OUT_OF_DATE</code>。实测同基线 4 类 disjoint 并发（改不同文件 / 新增文件 / 删除 + 改兄弟 / 新增嵌套子树）全部落地，同文件并发仍是干净的 <code>E160028</code>，<code>verify</code> 全过。</li>
   <li><strong>created_rev 修复（已完成）</strong>：提交时把改动节点 <code>created_rev</code> 记为 new_rev（<code>stampCreatedRev</code>）。此前修改过的文件仍是旧值，<code>libsvn_repos</code> 的 <code>check_out_of_date()</code> 判不出来，脏提交要走到写文本才失败（<code>Delta source ended unexpectedly</code>）。</li>
   <li><strong>锁过期（已完成）</strong>：过期锁不再保护路径，<code>fLock</code> 可直接接管，<code>fGetLock</code>/<code>fGetLocks</code> 视为不存在。</li>
-  <li><strong>txn checkpoint 频率</strong>：每次结构变更都 flush + 一次 PUT，大批量 <code>svnadmin load</code> 时可考虑批量/阈值触发。</li>
+  <li><strong>txn checkpoint 批量（已完成）</strong>：默认每 8 次变更落一次盘（<code>ZSTORE_TXN_CHECKPOINT_EVERY</code> 可调）。120 revision / 240 文件改动的 <code>svnadmin load</code>：每次落盘 9.03 s → 每 8 次 6.59 s（−27%），每 32 次 6.46 s，基本不落盘 6.62 s，说明剩余开销在每对象一次 HTTP 而不是 checkpoint。回归 <code>verify</code>、<code>log</code>、<code>blame</code>、<code>dump</code>、<code>hotcopy</code>、<code>lstxns</code> 全过。</li>
   <li><strong>内部 txn prop 过滤</strong>：<code>svn:txn-user-agent</code>、<code>svn:txn-client-compat-version</code> 目前会写进 rev 记录与 dump 输出，语义上应过滤。</li>
 </ul>
 

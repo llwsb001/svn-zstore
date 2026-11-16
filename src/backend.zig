@@ -44,6 +44,8 @@ pub const Txn = struct {
     props: []const u8 = "",
     dirs: std.StringHashMap(*store.Tree),
     a: std.mem.Allocator,
+    /// mutations since the last persisted checkpoint
+    pending: usize = 0,
 };
 
 pub const Ctx = struct {
@@ -1705,11 +1707,30 @@ fn txnOnlyErr() [*c]c.svn_error_t {
     return err(c.SVN_ERR_FS_GENERAL, "cannot modify a revision root", .{});
 }
 
+/// How many mutations share one persisted checkpoint. 1 = durable after every
+/// edit (slow on bulk load); larger values trade a few unflushed edits for far
+/// fewer tree PUTs. Override with ZSTORE_TXN_CHECKPOINT_EVERY.
+var g_ckpt_every: usize = 0;
+
+fn ckptEvery() usize {
+    if (g_ckpt_every == 0) {
+        g_ckpt_every = 8;
+        if (c.getenv("ZSTORE_TXN_CHECKPOINT_EVERY")) |v| {
+            const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8;
+            if (n > 0) g_ckpt_every = n;
+        }
+    }
+    return g_ckpt_every;
+}
+
 fn checkpoint(ctx: *Ctx) void {
-    // Persist the transaction after every mutation so an interrupted commit
-    // (server crash, dropped connection) can be reopened by svnadmin.
+    // Persist the transaction so an interrupted commit (server crash, dropped
+    // connection) can be reopened by svnadmin. Batched: only every Nth mutation
+    // writes, so bulk `svnadmin load` does not pay a checkpoint per file.
     const t = ctx.txn orelse return;
     if (ctx.rev != t.base_rev) return;
+    t.pending += 1;
+    if (ckptEvery() > 1 and t.pending % ckptEvery() != 0) return;
     const root_tree = treeAt(ctx, "/") catch return;
     const key = flushDir(ctx, "/", root_tree) catch |e| {
         logf("txn checkpoint failed to flush: {s}", .{@errorName(e)});
