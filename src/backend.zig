@@ -511,6 +511,12 @@ fn lockToSvn(rec: store.LockRec, pool: ?*c.apr_pool_t) [*c]c.svn_lock_t {
     return lk;
 }
 
+/// Locks carry an optional expiration; an expired lock no longer protects the
+/// path, so callers must be able to take it over without --steal.
+fn lockExpired(rec: store.LockRec, now: i64) bool {
+    return rec.expires > 0 and rec.expires < now;
+}
+
 fn fLock(
     fs_: [*c]c.svn_fs_t,
     targets: ?*c.apr_hash_t,
@@ -533,7 +539,13 @@ fn fLock(
         const path = std.mem.span(@as([*c]const u8, @ptrCast(path_ptr)));
         const target: ?*align(1) const c.svn_fs_lock_target_t = if (c.apr_hash_this_val(hi)) |v| @ptrCast(v) else null;
 
-        const existing = store.loadLock(&zs.client, a, path) catch |e| return mapErr(e, "cannot read lock");
+        const now = c.apr_time_now();
+        var existing = store.loadLock(&zs.client, a, path) catch |e| return mapErr(e, "cannot read lock");
+        const existing_expired = if (existing) |e0| lockExpired(e0, now) else false;
+        if (existing_expired) {
+            logf("lock on {s} expired at {d}, allowing a new lock", .{ path, existing.?.expires });
+            existing = null; // expired locks do not block new owners
+        }
         if (existing != null and steal_lock == 0) {
             return err(c.SVN_ERR_FS_PATH_ALREADY_LOCKED, "path '{s}' is already locked", .{path});
         }
@@ -551,7 +563,7 @@ fn fLock(
             .expires = expiration_date,
             .dav = is_dav_comment != 0,
         };
-        if (steal_lock != 0) {
+        if (steal_lock != 0 or existing_expired) {
             store.putLock(&zs.client, a, rec) catch |e| return mapErr(e, "cannot write lock");
         } else {
             const ok = store.putLockIfAbsent(&zs.client, a, rec) catch |e| return mapErr(e, "cannot write lock");
@@ -618,8 +630,11 @@ fn fGetLock(lock: [*c][*c]c.svn_lock_t, fs_: [*c]c.svn_fs_t, path: [*c]const u8,
     const zs = ZStore.from(fs_);
     const norm = normPath(gpa, std.mem.span(path)) catch return err(c.SVN_ERR_FS_GENERAL, "oom", .{});
     defer gpa.free(norm);
-    const rec = (store.loadLock(&zs.client, gpa, norm) catch |e| return mapErr(e, "cannot read lock")) orelse
+    const rec0 = (store.loadLock(&zs.client, gpa, norm) catch |e| return mapErr(e, "cannot read lock")) orelse
         return err(c.SVN_ERR_FS_NO_SUCH_LOCK, "path '{s}' is not locked", .{norm});
+    if (lockExpired(rec0, c.apr_time_now()))
+        return err(c.SVN_ERR_FS_NO_SUCH_LOCK, "lock on '{s}' has expired", .{norm});
+    const rec = rec0;
     lock.* = lockToSvn(rec, pool);
     return noError();
 }
@@ -640,7 +655,9 @@ fn fGetLocks(
         for (all) |rec| gpa.free(rec.path);
         gpa.free(all);
     }
+    const now = c.apr_time_now();
     for (all) |rec| {
+        if (lockExpired(rec, now)) continue;
         const match = if (depth == c.svn_depth_infinity)
             std.mem.startsWith(u8, rec.path, base)
         else if (depth == c.svn_depth_immediates) blk: {
@@ -765,6 +782,216 @@ fn flushDir(ctx: *Ctx, path: []const u8, tree: *store.Tree) ![]const u8 {
     return key;
 }
 
+// ---------------------------------------------------------------------------
+// commit rebase: replay a transaction's changes onto a newer HEAD
+// ---------------------------------------------------------------------------
+
+fn sigAt(ctx: *Ctx, path: []const u8) !?store.Entry {
+    const e = (entryAt(ctx, path) catch return null) orelse return null;
+    return e.*;
+}
+
+fn sameEntry(a: store.Entry, b: store.Entry) bool {
+    return a.kind == b.kind and std.mem.eql(u8, a.key, b.key) and std.mem.eql(u8, a.props, b.props);
+}
+
+fn collectChangePaths(ctx: *Ctx, parent_rev: i64) !std.ArrayList(Change) {
+    var out = std.ArrayList(Change).empty;
+    errdefer {
+        for (out.items) |c_| {
+            gpa.free(c_.path);
+            gpa.free(c_.copyfrom_path);
+        }
+        out.deinit(gpa);
+    }
+    try collectChanges(ctx, parent_rev, &out);
+    return out;
+}
+
+fn freeChanges(list: *std.ArrayList(Change)) void {
+    for (list.items) |c_| {
+        gpa.free(c_.path);
+        gpa.free(c_.copyfrom_path);
+    }
+    list.deinit(gpa);
+}
+
+fn depthOf(path: []const u8) usize {
+    var n: usize = 0;
+    for (path) |ch| {
+        if (ch == '/') n += 1;
+    }
+    return n;
+}
+
+fn importSubtree(dst: *Ctx, src: *Ctx, path: []const u8, created_rev: i64) !void {
+    if (dmap(dst).get(path) == null) {
+        const t = try gpa.create(store.Tree);
+        t.* = .{ .dirty = true, .path = try gpa.dupe(u8, path) };
+        try dmap(dst).put(try gpa.dupe(u8, path), t);
+    }
+    const dst_tree = try treeAt(dst, path);
+    const src_tree = try treeAt(src, path);
+    for (src_tree.entries.items) |se| {
+        const child_path = try joinChild(gpa, path, se.name);
+        defer gpa.free(child_path);
+        if (dst_tree.findIndex(se.name) != null) _ = dst_tree.remove(se.name);
+        try dst_tree.insert(gpa, .{
+            .name = try gpa.dupe(u8, se.name),
+            .kind = se.kind,
+            .key = try gpa.dupe(u8, se.key),
+            .size = se.size,
+            .created_rev = if (se.created_rev >= 0) se.created_rev else created_rev,
+            .created_path = try gpa.dupe(u8, se.created_path),
+            .props = try gpa.dupe(u8, se.props),
+            .copyfrom_rev = se.copyfrom_rev,
+            .copyfrom_path = try gpa.dupe(u8, se.copyfrom_path),
+        });
+        if (se.kind == .dir) try importSubtree(dst, src, child_path, created_rev);
+    }
+    dst_tree.dirty = true;
+}
+
+/// Replay the transaction's changes (base -> txn) onto the current HEAD root.
+/// Conflicting paths (changed both in HEAD and in the transaction) abort with
+/// SVN_ERR_FS_TXN_OUT_OF_DATE; disjoint changes merge cleanly.
+fn rebaseOntoTxnHead(t: *Txn, head_rev: i64, head_root: []const u8) ![]const u8 {
+    var base_ctx = Ctx{
+        .zs = t.zs,
+        .rev = t.base_rev,
+        .txn = null,
+        .root_key = t.root_key,
+        .dirs = null,
+        .a = gpa,
+        .dirs_store = std.StringHashMap(*store.Tree).init(gpa),
+    };
+    defer base_ctx.dirs_store.deinit();
+    var head_ctx = Ctx{
+        .zs = t.zs,
+        .rev = head_rev,
+        .txn = null,
+        .root_key = head_root,
+        .dirs = null,
+        .a = gpa,
+        .dirs_store = std.StringHashMap(*store.Tree).init(gpa),
+    };
+    defer head_ctx.dirs_store.deinit();
+    var txn_ctx = Ctx{
+        .zs = t.zs,
+        .rev = t.base_rev,
+        .txn = t,
+        .root_key = t.root_key,
+        .dirs = &t.dirs,
+        .a = gpa,
+        .dirs_store = std.StringHashMap(*store.Tree).init(gpa),
+    };
+    defer txn_ctx.dirs_store.deinit();
+
+    var txn_changes = try collectChangePaths(&txn_ctx, t.base_rev);
+    defer freeChanges(&txn_changes);
+    var head_changes = try collectChangePaths(&head_ctx, t.base_rev);
+    defer freeChanges(&head_changes);
+
+    // A path touched on both sides is a real conflict unless the resulting
+    // entry is identical (e.g. both sides only changed children of a dir).
+    for (txn_changes.items) |tc| {
+        const txn_e: ?store.Entry = if (entryAt(&txn_ctx, tc.path) catch null) |e| e.* else null;
+        const base_e = sigAt(&base_ctx, tc.path) catch null;
+        const head_e = sigAt(&head_ctx, tc.path) catch null;
+        const head_touched = !sameOptional(base_e, head_e);
+        if (!head_touched) continue;
+        if (tc.node_kind == c.svn_node_dir and !tc.prop_mod) continue;
+        const merged_ok = sameOptional(txn_e, head_e);
+        if (!merged_ok) return error.Conflict;
+    }
+
+    // Apply deletions first (deepest first), then additions/modifications
+    // (shallowest first) so parents exist before their children.
+    var i: usize = 0;
+    while (i < txn_changes.items.len) : (i += 1) {
+        const tc = txn_changes.items[i];
+        if (tc.kind != c.svn_fs_path_change_delete) continue;
+        const loc = (locate(&head_ctx, tc.path) catch null) orelse continue;
+        _ = loc.tree.remove(baseName(tc.path));
+        loc.tree.dirty = true;
+    }
+    var pass: usize = 0;
+    while (pass < 2) : (pass += 1) {
+        i = 0;
+        while (i < txn_changes.items.len) : (i += 1) {
+            const tc = txn_changes.items[i];
+            if (tc.kind == c.svn_fs_path_change_delete) continue;
+            const is_dir = tc.node_kind == c.svn_node_dir;
+            if (pass == 0 and !is_dir) continue; // dirs first, then files
+            if (pass == 1 and is_dir) continue;
+            const src_entry = (entryAt(&txn_ctx, tc.path) catch null) orelse continue;
+            const parent_path = parentOf(tc.path);
+            const parent = (treeAt(&head_ctx, parent_path) catch null) orelse continue;
+            if (parent.findIndex(baseName(tc.path)) != null) _ = parent.remove(baseName(tc.path));
+            try parent.insert(gpa, .{
+                .name = try gpa.dupe(u8, baseName(tc.path)),
+                .kind = src_entry.kind,
+                .key = try gpa.dupe(u8, src_entry.key),
+                .size = src_entry.size,
+                .created_rev = if (src_entry.created_rev >= 0) src_entry.created_rev else head_rev + 1,
+                .created_path = try gpa.dupe(u8, src_entry.created_path),
+                .props = try gpa.dupe(u8, src_entry.props),
+                .copyfrom_rev = src_entry.copyfrom_rev,
+                .copyfrom_path = try gpa.dupe(u8, src_entry.copyfrom_path),
+            });
+            parent.dirty = true;
+            if (is_dir) try importSubtree(&head_ctx, &txn_ctx, tc.path, head_rev + 1);
+            if (!is_dir and src_entry.kind == .file) {
+                // keep the file's own entry (props/size already copied)
+            }
+        }
+    }
+
+    stampCreatedRev(&head_ctx, txn_changes.items, head_rev + 1);
+    const root_tree = try treeAt(&head_ctx, "/");
+    return try flushDir(&head_ctx, "/", root_tree);
+}
+
+/// Mark every directory from the root down to `path` dirty so a later flush
+/// rewrites the chain of tree objects.
+fn markPathDirty(ctx: *Ctx, path: []const u8) void {
+    const root = treeAt(ctx, "/") catch return;
+    root.dirty = true;
+    if (path.len <= 1) return;
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i == path.len or path[i] == '/') {
+            const sub = path[0..i];
+            if (sub.len == 0) continue;
+            const t = treeAt(ctx, sub) catch return;
+            t.dirty = true;
+        }
+    }
+}
+
+/// A node's created_rev must be the revision in which it last changed; repos'
+/// check_out_of_date() compares it against the client's base to detect stale
+/// commits. Without this, modified files keep their original created_rev and
+/// stale commits slip past the check.
+fn stampCreatedRev(ctx: *Ctx, changes: []const Change, rev: i64) void {
+    for (changes) |c_| {
+        if (c_.kind == c.svn_fs_path_change_delete) continue;
+        const loc = (locate(ctx, c_.path) catch null) orelse continue;
+        const e = &loc.tree.entries.items[loc.idx];
+        e.created_rev = rev;
+        gpa.free(e.created_path);
+        e.created_path = gpa.dupe(u8, c_.path) catch "";
+        loc.tree.dirty = true;
+        markPathDirty(ctx, c_.path);
+    }
+}
+
+fn sameOptional(a: ?store.Entry, b: ?store.Entry) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return sameEntry(a.?, b.?);
+}
+
 fn tCommit(
     conflict_p: [*c][*c]const u8,
     new_rev_p: [*c]c.svn_revnum_t,
@@ -808,6 +1035,7 @@ fn tCommit(
     // re-upload what they already produced.
     var attempt: usize = 0;
     var committed: i64 = -1;
+    var commit_root: []const u8 = root_key;
     while (attempt < 32) : (attempt += 1) {
         var head_rev: i64 = -1;
         var head_etag: ?[]u8 = null;
@@ -823,11 +1051,48 @@ fn tCommit(
         }
         const new_rev = head_rev + 1;
 
+        // Replay our changes on top of the current HEAD when it moved while
+        // the transaction was open, so disjoint concurrent commits merge
+        // instead of losing or rejecting each other's work.
+        var head_root: []const u8 = "";
+        if (t.base_rev != head_rev) {
+            const lookup = store.headWithEtag(&zs.client, gpa) catch return err(c.SVN_ERR_FS_GENERAL, "cannot read HEAD", .{});
+            defer if (lookup) |hw| {
+                if (hw.etag) |e| gpa.free(e);
+                gpa.free(hw.head.root);
+            };
+            if (lookup) |hw| head_root = hw.head.root;
+            if (head_root.len == 0) return err(c.SVN_ERR_FS_GENERAL, "cannot read HEAD root", .{});
+            commit_root = rebaseOntoTxnHead(t, head_rev, head_root) catch |e| switch (e) {
+                error.Conflict => return err(c.SVN_ERR_FS_TXN_OUT_OF_DATE, "transaction base r{d} is out of date (HEAD is r{d})", .{ t.base_rev, head_rev }),
+                else => return mapErr(e, "cannot rebase transaction onto HEAD"),
+            };
+        }
+        if (t.base_rev == head_rev) {
+            var stamp_ctx = Ctx{
+                .zs = t.zs,
+                .rev = t.base_rev,
+                .txn = t,
+                .root_key = t.root_key,
+                .dirs = &t.dirs,
+                .a = gpa,
+                .dirs_store = std.StringHashMap(*store.Tree).init(gpa),
+            };
+            defer stamp_ctx.dirs_store.deinit();
+            var list = collectChangePaths(&stamp_ctx, t.base_rev) catch null;
+            if (list) |*ch| {
+                defer freeChanges(ch);
+                stampCreatedRev(&stamp_ctx, ch.items, new_rev);
+                if (treeAt(&stamp_ctx, "/") catch null) |rt| {
+                    commit_root = flushDir(&stamp_ctx, "/", rt) catch commit_root;
+                }
+            }
+        }
         const rev_cond: s3.Cond = .if_absent;
         const rev_etag: ?[]u8 = store.putRevCond(&zs.client, gpa, .{
             .rev = new_rev,
             .parent = t.base_rev,
-            .root = root_key,
+            .root = commit_root,
             .props = props_key,
         }, rev_cond) catch |e| switch (e) {
             // Another writer already published this revision number; just
@@ -838,7 +1103,7 @@ fn tCommit(
         if (rev_etag) |etag| gpa.free(etag);
 
         const head_cond: s3.Cond = if (head_etag) |etag| .{ .if_match = etag } else .if_absent;
-        const new_head_etag: ?[]u8 = store.putHeadCond(&zs.client, gpa, new_rev, root_key, head_cond) catch |e| switch (e) {
+        const new_head_etag: ?[]u8 = store.putHeadCond(&zs.client, gpa, new_rev, commit_root, head_cond) catch |e| switch (e) {
             error.Precondition => {
                 // Lost the race.  Head moved while this transaction was open,
                 // so committing it as-is would silently overwrite whatever the
@@ -863,7 +1128,7 @@ fn tCommit(
     zs.youngest = new_rev;
     new_rev_p.* = @intCast(new_rev);
     conflict_p.* = null;
-    logf("committed r{d} (root {s})", .{ new_rev, root_key[0..@min(root_key.len, 12)] });
+    logf("committed r{d} (root {s})", .{ new_rev, commit_root[0..@min(commit_root.len, 12)] });
     return noError();
 }
 

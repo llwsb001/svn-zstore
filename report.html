@@ -164,9 +164,10 @@ svn blame file:///tmp/R/trunk/a.txt</pre>
 <h2>9. 尚未闭环 & 待决策</h2>
 <ul>
   <li><strong>真实 S3 选型</strong>：RustFS 1.0.6 已实测跑通（见第 6 节），可作为落地方案；MinIO 开源二进制 <code>dl.min.io</code> 已 410、SeaweedFS release zip 无效。若要上生产，还需评估 RustFS 的运维方式（进程托管、TLS、多盘/多节点）。</li>
-  <li><strong>三方合并</strong>：当前并发冲突直接拒绝（不丢数据，但 disjoint 路径也需 update 后重试）；后续可把 txn diff 重放到新 HEAD 上做真合并。</li>
+  <li><strong>三方合并（已完成）</strong>：txn 打开后 HEAD 前进时，把 txn 相对 base 的改动重放到新 HEAD（<code>rebaseOntoTxnHead</code>）；同一路径两边都改且结果不同才判 <code>SVN_ERR_FS_TXN_OUT_OF_DATE</code>。实测同基线 4 类 disjoint 并发（改不同文件 / 新增文件 / 删除 + 改兄弟 / 新增嵌套子树）全部落地，同文件并发仍是干净的 <code>E160028</code>，<code>verify</code> 全过。</li>
+  <li><strong>created_rev 修复（已完成）</strong>：提交时把改动节点 <code>created_rev</code> 记为 new_rev（<code>stampCreatedRev</code>）。此前修改过的文件仍是旧值，<code>libsvn_repos</code> 的 <code>check_out_of_date()</code> 判不出来，脏提交要走到写文本才失败（<code>Delta source ended unexpectedly</code>）。</li>
+  <li><strong>锁过期（已完成）</strong>：过期锁不再保护路径，<code>fLock</code> 可直接接管，<code>fGetLock</code>/<code>fGetLocks</code> 视为不存在。</li>
   <li><strong>txn checkpoint 频率</strong>：每次结构变更都 flush + 一次 PUT，大批量 <code>svnadmin load</code> 时可考虑批量/阈值触发。</li>
-  <li><strong>锁过期与 steal</strong>：已存 expires，但未做自动过期清理/抢占。</li>
   <li><strong>内部 txn prop 过滤</strong>：<code>svn:txn-user-agent</code>、<code>svn:txn-client-compat-version</code> 目前会写进 rev 记录与 dump 输出，语义上应过滤。</li>
 </ul>
 

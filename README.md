@@ -162,7 +162,21 @@ secret_key=zstore
 **提交原子性**：`revs/<n>` 用 `If-None-Match: *` 抢号，`HEAD` 用 `If-Match: <etag>` 更新；
 抢号失败或被别人先更新 HEAD 时不重试覆盖，而是回滚刚写的 `revs/<n>` 并返回
 `E160028 transaction base rN is out of date (HEAD is rM)`。因此多客户端并发提交**不会丢更新**，
-语义等价于 FSFS 的冲突拒绝（尚未做三方合并，disjoint 路径的并发提交也需要 update 后重试）。
+**三方合并（commit rebase）**：txn 打开后 HEAD 前进时，不再直接拒绝，而是把 txn
+相对 base 的改动重放到新 HEAD（`rebaseOntoTxnHead`）。冲突判定按叶子和目录属性做：
+同一路径两边都改且结果不同 → `SVN_ERR_FS_TXN_OUT_OF_DATE`；只有子节点变化的父目录、
+以及内容恰好一致的改动不算冲突。新增目录子树用 `importSubtree` 递归搬入。
+
+实测（仓库 `/tmp/RC`，10 个 revision）：
+
+| 场景 | 结果 |
+|---|---|
+| 同基线两个 wc 各改不同文件 | 都成功（r2 + rebase 后的 r3） |
+| 一边新增文件、另一边改别的文件 | 成功（r5、r6） |
+| 一边 `svn rm`、另一边改兄弟文件 | 成功（r7、r8） |
+| 一边新增 `dir1/sub/deep.txt` 子树、另一边改文件 | 成功（r9、r10） |
+| 两边改**同一个**文件 | 后者 `E160028 File '/trunk/x.txt' is out of date` |
+| `svnadmin verify` / `svn blame` / `dump` / `hotcopy` | 全通过 |
 
 **锁**：`locks/<sha256(path)>` 单对象保存 `path/token/owner/comment/created/expires/dav`；
 创建用条件写防重复，`unlock` 校验 token（`--force` 走 break）；`svnadmin lslocks` 与
@@ -183,3 +197,12 @@ repos 层会复制 `db/uuid`，两边同 uuid 会撞 key，故目标自动分配
 **事务持久化**：`fBeginTxn` 写 `txns/<id>`，每次结构变更（建/删/拷/改属性/写文本）
 打 checkpoint（flush 根树 + 更新 txn 记录）；提交成功或 abort 时删除记录。
 已用 `svnadmin lstxns` / `rmtxns` 验证列举与清除（伪造 `txns/ztest-1` 可被列出并删除）。
+
+**created_rev 修复**：提交时必须把本 revision 改动的节点 `created_rev` 记为 `new_rev`
+（`stampCreatedRev` + `markPathDirty`）。此前修改过的文件仍保留旧值，`svn ls -v` 显示
+`r1`，导致 `libsvn_repos` 的 `check_out_of_date()` 判不出来，脏提交会一路走到写文本
+阶段才失败。修好后 `svn ls -v` 显示 `x.txt r2 / y.txt r3`，同文件并发提交也能在客户端
+前置检查处得到干净的 `E160028`。
+
+**锁过期**：`expires` 已写入记录；过期锁不再保护路径——`fLock` 视为无锁允许他人接管
+（无需 `--steal`），`fGetLock` 返回 `SVN_ERR_FS_NO_SUCH_LOCK`，`fGetLocks` 过滤掉过期项。
