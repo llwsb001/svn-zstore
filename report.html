@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Subversion 存储层换成对象存储 — Zig 后端模块交付报告</title>
+<style>
+  :root{
+    --bg:#fff; --fg:#1c2333; --muted:#5a6477; --line:#e3e7ef;
+    --card:#f7f9fc; --accent:#1f6feb; --ok:#0f8a4d; --warn:#b25e00; --bad:#c0392b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto;padding:48px 28px 80px}
+  h1{font-size:28px;line-height:1.3;margin:0 0 8px;letter-spacing:-.3px}
+  .sub{color:var(--muted);font-size:14px;margin-bottom:32px}
+  h2{font-size:19px;margin:40px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:22px 0 8px;color:var(--fg)}
+  p{margin:8px 0}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  code{background:#eef2f9;padding:1px 5px;border-radius:4px;font-size:13px}
+  pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto;font-size:13px;line-height:1.6}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card .k{font-size:12px;color:var(--muted);letter-spacing:.4px;text-transform:uppercase}
+  .card .v{font-size:20px;font-weight:600;margin-top:6px}
+  .card .n{font-size:12.5px;color:var(--muted);margin-top:4px}
+  table{border-collapse:collapse;width:100%;font-size:14px;margin:12px 0}
+  th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}
+  th{background:#f3f6fb;font-weight:600;font-size:13px;color:var(--muted)}
+  td.ok{color:var(--ok);font-weight:600}
+  td.no{color:var(--bad);font-weight:600}
+  .pill{display:inline-block;font-size:12px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);background:#fff}
+  ul{margin:6px 0 6px 22px}
+  li{margin:5px 0}
+  .note{border-left:3px solid var(--accent);background:#f4f8ff;padding:10px 14px;border-radius:0 6px 6px 0;font-size:14px;margin:14px 0}
+  .warn{border-left:3px solid var(--warn);background:#fff8ef}
+  footer{margin-top:48px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Subversion 存储层替换：Zig 写的 <code>svn_fs</code> 后端 + S3 对象存储</h1>
+<div class="sub">方案 2 交付 · subversion trunk（DSO 动态模块）· Zig 0.17.0 · 2026-11-16</div>
+
+<div class="cards">
+  <div class="card"><div class="k">后端模块</div><div class="v">libsvn_fs_zstore-1.so.0</div><div class="n">fs-type = <code>zstore</code></div></div>
+  <div class="card"><div class="k">本地 db/ 占用</div><div class="v">≈ 0</div><div class="n">只留 config / uuid / 极小标记</div></div>
+  <div class="card"><div class="k">读写链路</div><div class="v">全部打通</div><div class="n">ls / cat / log / diff / co / ci / up / blame</div></div>
+  <div class="card"><div class="k">管理命令</div><div class="v">create · verify · dump · load</div><div class="n">dump→load 往返内容一致</div></div>
+</div>
+
+<h2>1. 要做的事与最终选型</h2>
+<p>目标是换掉 SVN 服务端的存储，不再用 FSFS 落盘，而把 revision 数据放到对象存储；Zig 负责写后端。</p>
+<p>最终采用<strong>方案 2</strong>：Zig 实现一个可插拔的 <code>svn_fs</code> 后端模块，SVN 通过 DSO 加载它，模块内部用自写 S3 客户端（SigV4 签名 + libcurl）把目录树快照与文件内容写成对象。方案 3（Zig 写独立存储网关）未采用。</p>
+<div class="note">关键前提：subversion 必须用 <code>--enable-runtime-module-search</code> 配置，否则 <code>SVN_USE_DSO</code> 未定义，loader 直接报 <span class="pill">Unknown FS type 'zstore'</span>；模块文件名必须是 <code>libsvn_fs_zstore-1.so.0</code>（带 <code>.0</code>）。</div>
+
+<h2>2. 架构</h2>
+<pre>svn / svnadmin / svnserve
+        │  svn_fs_open2("zstore") → dlopen libsvn_fs_zstore-1.so.0
+        ▼
+src/fs.zig ─── fs 级 vtable（youngest_rev / revision_root / begin_txn / verify …）
+src/backend.zig ─── root vtable 33 项 + txn 7 项 + changes-iterator + history + id
+        │
+        ├── src/store.zig  对象模型与编解码（HEAD / revs / trees / blobs / props）
+        └── src/s3.zig     PUT / GET / EXISTS / DELETE，SigV4 + libcurl
+                            │
+                            ▼
+                     S3 / MinIO（bucket: svn，path-style）</pre>
+<p>Zig 0.17 已移除 <code>@cImport</code>，C 互操作全部改走 <code>zig translate-c</code>：<code>src/c.h</code> 聚合 apr + svn 头，生成 <code>svn_bindings.zig</code>（7256 行）与 <code>curl_bindings.zig</code>（4001 行）。同时 Zig 0.17 的 std 变化很大（无 <code>std.fs.cwd</code>、<code>ArrayList</code> 变 unmanaged、无 <code>bufPrintZ</code>），所以本地文件 IO 走 libc / APR。</p>
+
+<h2>3. 桶内对象格式</h2>
+<pre>&lt;prefix&gt;/format            zstore/1\n
+&lt;prefix&gt;/HEAD              rev=&lt;n&gt;\nroot=&lt;sha256&gt;\n
+&lt;prefix&gt;/revs/&lt;n&gt;          rev=/parent=/root=/props=      ← props 是 blob key
+&lt;prefix&gt;/trees/&lt;sha256&gt;   目录树快照（内容寻址，天然去重）
+&lt;prefix&gt;/blobs/&lt;sha256&gt;   文件内容、props 编码块</pre>
+<ul>
+  <li>tree 编码：<code>"ZST" + ver(1) + count(u32 BE)</code>；每条目 <code>name kind(u8) size created_rev created_path props copyfrom_rev copyfrom_path key</code></li>
+  <li>props 编码：<code>u32 BE count + (name,value)*</code>，解码结果必须 NUL 结尾</li>
+  <li><code>HEAD</code> 最后写：依赖"单写者"假设，多客户端并发提交目前没有 CAS 保护</li>
+</ul>
+
+<h2>4. 本轮主线：把读路径与 blame 修到全绿</h2>
+<p>被替换段之前 <code>svn blame</code> 挂在 <code>rev_hunt.c:1695 (mainline_path_revisions->nelts &gt; 0)</code>。这轮从 gdb + 逐点打日志定位，连带修掉四个真实缺陷：</p>
+<table>
+<tr><th style="width:26%">缺陷</th><th>表现与真因</th><th style="width:14%">修法</th></tr>
+<tr><td>事务路径未归一化</td><td><code>svnadmin load</code> 后 trunk 空：编辑器回调给的是相对路径 <code>trunk</code>，树缓存键是 <code>/trunk</code>，目录对象从未被 flush</td><td class="ok">normPath 强制前导 <code>/</code></td></tr>
+<tr><td>changed paths 缺前导斜杠</td><td><code>svn log -v</code> 打出 <code>M trunk</code> 而非 <code>M /trunk</code>；路径定向 log 漏掉修改版本，进而让 <code>ls -r1 URL/trunk</code> 报 location 找不到</td><td class="ok">从根 <code>/</code> 起拼路径 + NUL 结尾</td></tr>
+<tr><td>node id 编码了 revision</td><td>同一节点跨版本 id 不同 → rev_hunt 判定"无关对象"，历史定位中断</td><td class="ok">id = path + 内容 key</td></tr>
+<tr><td>node_relation 过严</td><td>同路径内容不同被判 <code>unrelated</code>，rev_hunt 直接 break，旧版本位置全丢</td><td class="ok">返回 <code>common_ancestor</code></td></tr>
+<tr><td>history_prev 过早终止</td><td>比较 <code>rev-1</code> 的 key 不同就返回 null，history 链第一步就断，blame 只算出一行</td><td class="ok">首次先把当前点返回一次，再走 copyfrom/前一个版本</td></tr>
+</table>
+<p>修完之后 blame 输出逐行归属正确：<code>1 user hello / 2 user more</code>（第一行来自 r1，追加行来自 r2）。</p>
+
+<h2>5. 验证矩阵（本轮实测）</h2>
+<table>
+<tr><th>能力</th><th>file://（ra_local）</th><th>svn://（svnserve）</th></tr>
+<tr><td><code>ls</code> / <code>ls -R</code> / <code>ls -r&lt;N&gt;</code></td><td class="ok">通过</td><td class="ok">通过</td></tr>
+<tr><td><code>cat</code> / <code>cat -r&lt;N&gt;</code></td><td class="ok">通过</td><td class="ok">通过</td></tr>
+<tr><td><code>log</code>（含 <code>-v</code>、路径定向、<code>svn:date</code>）</td><td class="ok">通过</td><td class="ok">通过</td></tr>
+<tr><td><code>diff -r1:2</code></td><td class="ok">通过</td><td class="ok">通过</td></tr>
+<tr><td><code>co</code> / <code>ci</code> / <code>up</code> / <code>export</code></td><td class="ok">通过</td><td class="ok">通过</td></tr>
+<tr><td><code>blame</code>（跨 revision 逐行）</td><td class="ok">通过</td><td class="ok">通过</td></tr>
+<tr><td><code>svnadmin create --fs-type=zstore</code></td><td class="ok">通过</td><td>—</td></tr>
+<tr><td><code>svnadmin verify</code></td><td class="ok">通过（逐 revision）</td><td>—</td></tr>
+<tr><td><code>svnadmin dump</code> → <code>load</code></td><td class="ok">往返一致：trunk/a.txt b.txt d.txt、changed paths 全对</td><td>—</td></tr>
+<tr><td>锁 / hotcopy / recover / pack</td><td class="no">未实现</td><td class="no">未实现</td></tr>
+<tr><td>事务重启后继续（open_txn 持久化）</td><td class="no">UNSUPPORTED（事务仅内存态）</td><td class="no">同左</td></tr>
+</table>
+
+<h2>6. 真实 S3 后端：RustFS 实测通过</h2>
+<p>RustFS 1.0.6（Rust 写的 S3 兼容对象存储，单二进制 378&nbsp;MB）在本机实测：<strong>代码零改动，只改 <code>db/zstore.conf</code> 的 endpoint</code></strong>。它默认只支持 path-style 寻址，正好与我们的客户端一致。</p>
+<table>
+<tr><th>项</th><th>结果</th></tr>
+<tr><td><code>import</code> / <code>co</code> / <code>ci</code></td><td class="ok">通过</td></tr>
+<tr><td><code>ls</code> / <code>log</code> / <code>blame</code></td><td class="ok">通过（blame 逐行 1 hello / 2 more）</td></tr>
+<tr><td><code>svnadmin verify</code></td><td class="ok">通过</td></tr>
+<tr><td><code>dump</code> → <code>load</code></td><td class="ok">通过（trunk/a.txt b.txt）</td></tr>
+<tr><td><code>svn://</code>（svnserve）</td><td class="ok">通过</td></tr>
+<tr><td>桶内对象落地</td><td class="ok">15 个对象；本地 <code>db/</code> 只剩 4 个几字节小文件</td></tr>
+<tr><td>重启 RustFS 后读旧仓库</td><td class="ok">数据持久（moto 是内存态，重启即丢）</td></tr>
+</table>
+<pre>RUSTFS_VOLUMES=/tmp/rustfs-data RUSTFS_ADDRESS=":9100" \
+RUSTFS_ACCESS_KEY="zstore" RUSTFS_SECRET_KEY="zstore" \
+RUSTFS_CONSOLE_ENABLE=false ./rustfs server /tmp/rustfs-data
+
+# db/zstore.conf
+endpoint=http://127.0.0.1:9100
+region=us-east-1
+bucket=svn
+access_key=zstore
+secret_key=zstore</pre>
+<div class="note warn">注意：默认凭据是 <code>rustfsadmin/rustfsadmin</code>，务必覆盖；控制台 9001、API 9000（本机与 moto 共存时用 9100）；客户端若走 virtual-hosted 风格需设 <code>RUSTFS_SERVER_DOMAINS</code>。</div>
+
+<h2>7. 复现步骤</h2>
+<pre>cd svn-s3 &amp;&amp; zig build            # 产出 zig-out/lib/libsvn_fs_zstore-1.so.0
+
+# subversion trunk（关键开关）
+./configure --prefix=$PWD/install --enable-runtime-module-search &amp;&amp; make -j4
+
+# 运行
+SVN=/home/user/myproject/svn-zig
+LP=$(find $SVN/subversion -maxdepth 2 -name .libs -type d | tr '\n' ':')
+export LD_LIBRARY_PATH="$LP$PWD/zig-out/lib"
+svnadmin create --fs-type=zstore /tmp/R
+svn import -m r1 /tmp/imp3 file:///tmp/R
+svn log -v file:///tmp/R
+svn blame file:///tmp/R/trunk/a.txt</pre>
+
+<h2>7. 尚未闭环 & 待决策</h2>
+<ul>
+  <li><strong>真实 S3 选型</strong>：RustFS 1.0.6 已实测跑通（见第 6 节），可作为落地方案；MinIO 开源二进制 <code>dl.min.io</code> 已 410、SeaweedFS release zip 无效。若要上生产，还需评估 RustFS 的运维方式（进程托管、TLS、多盘/多节点）。</li>
+  <li><strong>并发提交原子性</strong>：现在依赖"HEAD 最后写 + 单写者"，没有 conditional PUT / CAS，多客户端同时提交可能丢更新。要补的话，用 S3 的 <code>If-None-Match</code>/版本号或引入轻量锁对象。</li>
+  <li><strong>锁 / hotcopy / recover / pack</strong> 未实现；锁一律返回 UNSUPPORTED，hotcopy 无对象层快照语义。</li>
+  <li><strong>open_txn 未持久化</strong>：进程重启后未提交事务不可恢复（对 svnadmin load 等一次性流程无影响）。</li>
+  <li><strong>内部 txn prop 过滤</strong>：<code>svn:txn-user-agent</code>、<code>svn:txn-client-compat-version</code> 目前会写进 rev 记录与 dump 输出，语义上应过滤。</li>
+</ul>
+
+<footer>
+ 交付物：<code>svn-s3/</code>（build.zig、src/*.zig、README.md、本报告）· 产物 <code>zig-out/lib/libsvn_fs_zstore-1.so.0</code><br>
+  测试仓库：<code>/tmp/R</code>（r1 import / r2 change）、<code>/tmp/R2</code>（dump→load）、<code>/tmp/repo1</code>（svn://）· 对象存储：moto_server :9000，bucket <code>svn</code>
+</footer>
+
+</div>
+</body>
+</html>
