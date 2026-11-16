@@ -146,8 +146,26 @@ secret_key=zstore</pre>
 </table>
 <p>关键坑：<code>fs_library_vtable_t.hotcopy</code> 收到的 src/dst 都是未打开的 <code>fs_new()</code> 壳（<code>fsap_data == NULL</code>）；<code>svn_fs_unlock_many</code> 的 hash value 是裸 token 字符串而不是 <code>svn_fs_lock_target_t*</code>；条件头必须进 SignedHeaders，否则 RustFS 403。</p>
 
-<h2>8. 复现步骤</h2>
-<pre>cd svn-s3 &amp;&amp; zig build            # 产出 zig-out/lib/libsvn_fs_zstore-1.so.0
+<h2>8. 性能：FSFS vs zstore</h2>
+<p>同一台云主机、同一份 120 revision / 240 文件改动的 dump（78 KB），zstore 侧接本地 RustFS（<code>127.0.0.1:9100</code>）。脚本 <code>bench/bench_fsfs_vs_zstore.py</code> 可复现。</p>
+<table>
+<tr><th>操作</th><th>FSFS</th><th>zstore（RustFS 本地）</th><th>倍数</th></tr>
+<tr><td><code>svnadmin load</code> 120 rev</td><td>2.35 s</td><td>5.92–6.15 s</td><td>2.5–2.6×</td></tr>
+<tr><td><code>svnadmin verify</code> 120 rev</td><td>2.05–2.37 s</td><td>3.30 s</td><td>1.4–1.6×</td></tr>
+<tr><td><code>svnadmin dump</code> 120 rev</td><td>2.35 s</td><td>3.20 s</td><td>1.36×</td></tr>
+<tr><td>单 revision 提交 400 个文件</td><td>2.39 s</td><td>3.84 s</td><td>1.6×</td></tr>
+<tr><td>检出 120 / 520 文件</td><td>2.42 / 2.39 s</td><td>3.20 / 3.22 s</td><td>≈ +0.8 s</td></tr>
+<tr><td>提交 / 检出 8 MB 单文件</td><td>2.40 s</td><td>3.20 s</td><td>≈ +0.8 s</td></tr>
+</table>
+<p>两个前提：</p>
+<ul>
+<li><strong>测量机抖动大</strong>：单进程启动成本在 0.4–3 s 之间跳，同一次测量常落在 ~0.8 s 的“量子”上。少于 0.8 s 的差异不可分辨，所以表里只保留能稳定分辨的批量项；检出这类小操作只体现固定开销，不代表真实吞吐差。</li>
+<li><strong>后端本身不慢</strong>：实测单次 S3 请求 1–2 ms（4 KB PUT/GET），zstore 仓库 <code>open</code> 全路径 3 ms（<code>ZSTORE_PROFILE=1</code> 打点 <code>conf+client</code> / <code>open</code> / <code>ensureLayout</code>）。批量成本来自“每对象一次 HTTP”：load 120 rev 要写 240 blob + 约 250 tree + 120 <code>revs/&lt;n&gt;</code> + 120 次 <code>HEAD</code>；verify 要把每个 revision 的树与 blob 全读一遍。</li>
+</ul>
+<p>定位：zstore 用外部对象存储换掉本地 <code>db/</code>，代价是每对象一次 RTT + 每连接一次固定开销；对象存储同机架/同可用区时可用，跨公网 S3 时延迟按对象数放大。另：构建务必用 <code>zig build -Drelease=true</code>（默认 Debug 版 18 MB，慢约 20%）。</p>
+
+<h2>9. 复现步骤</h2>
+<pre>cd svn-s3 &amp;&amp; zig build -Drelease=true   # 产出 zig-out/lib/libsvn_fs_zstore-1.so.0
 
 # subversion trunk（关键开关）
 ./configure --prefix=$PWD/install --enable-runtime-module-search &amp;&amp; make -j4
@@ -161,7 +179,7 @@ svn import -m r1 /tmp/imp3 file:///tmp/R
 svn log -v file:///tmp/R
 svn blame file:///tmp/R/trunk/a.txt</pre>
 
-<h2>9. 尚未闭环 & 待决策</h2>
+<h2>10. 尚未闭环 &amp; 待决策</h2>
 <ul>
   <li><strong>真实 S3 选型</strong>：RustFS 1.0.6 已实测跑通（见第 6 节），可作为落地方案；MinIO 开源二进制 <code>dl.min.io</code> 已 410、SeaweedFS release zip 无效。若要上生产，还需评估 RustFS 的运维方式（进程托管、TLS、多盘/多节点）。</li>
   <li><strong>三方合并（已完成）</strong>：txn 打开后 HEAD 前进时，把 txn 相对 base 的改动重放到新 HEAD（<code>rebaseOntoTxnHead</code>）；同一路径两边都改且结果不同才判 <code>SVN_ERR_FS_TXN_OUT_OF_DATE</code>。实测同基线 4 类 disjoint 并发（改不同文件 / 新增文件 / 删除 + 改兄弟 / 新增嵌套子树）全部落地，同文件并发仍是干净的 <code>E160028</code>，<code>verify</code> 全过。</li>

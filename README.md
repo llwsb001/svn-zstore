@@ -48,7 +48,7 @@ Zig 0.17 已移除 `@cImport`，因此绑定全部由 `zig translate-c` 生成�
 
 ```bash
 # 1) 编后端
-cd svn-s3 && zig build
+cd svn-s3 && zig build -Drelease=true   # 不加 -Drelease 会出 Debug 版（18 MB，慢 20%）
 ls zig-out/lib/libsvn_fs_zstore-1.so.0
 
 # 2) 编 SVN（只需一次；关键开关是 runtime module search）
@@ -221,3 +221,31 @@ repos 层会复制 `db/uuid`，两边同 uuid 会撞 key，故目标自动分配
 
 **锁过期**：`expires` 已写入记录；过期锁不再保护路径——`fLock` 视为无锁允许他人接管
 （无需 `--steal`），`fGetLock` 返回 `SVN_ERR_FS_NO_SUCH_LOCK`，`fGetLocks` 过滤掉过期项。
+
+## 性能：FSFS vs zstore
+
+同一台云主机、同一份 120 revision / 240 文件改动的 dump（78 KB），本地 RustFS（
+`127.0.0.1:9100`）。`bench/bench_fsfs_vs_zstore.py` 可复现。
+
+| 操作 | FSFS | zstore（RustFS 本地） | 倍数 |
+|---|---|---|---|
+| `svnadmin load` 120 rev | 2.35 s | 5.92–6.15 s | 2.5–2.6× |
+| `svnadmin verify` 120 rev | 2.05–2.37 s | 3.30 s | 1.4–1.6× |
+| `svnadmin dump` 120 rev | 2.35 s | 3.20 s | 1.36× |
+| 单 revision 提交 400 个文件 | 2.39 s | 3.84 s | 1.6× |
+| 检出 120 / 520 文件 | 2.42 / 2.39 s | 3.20 / 3.22 s | ≈ +0.8 s |
+| 提交 / 检出 8 MB 单文件 | 2.40 s | 3.20 s | ≈ +0.8 s |
+
+读结论时的两个前提：
+
+- 这台测试机调度抖动很大，单个进程的启动成本在 0.4–3 s 之间跳，同一次测量里
+  经常落在 ~0.8 s 的"量子"上。所以少于 0.8 s 的差异不可分辨，上表只保留能稳定
+  分辨的批量项；检出这类小操作只体现"固定开销"，不是真实吞吐差。
+- 后端本身不慢：实测单次 S3 请求 1–2 ms（4 KB PUT/GET），zstore 仓库 `open` 全路径
+  3 ms（`ZSTORE_PROFILE=1` 会打点 `conf+client` / `open` / `ensureLayout`）。
+  批量操作的成本来自"每对象一次 HTTP"：load 120 rev 要写 240 blobs + 约 250 trees +
+  120 `revs/<n>` + 120 次 `HEAD`；verify 要把每个 revision 的树和 blob 全读一遍。
+
+因此 zstore 的定位是"用外部对象存储换掉本地 `db/` 目录"，代价是每对象一次 RTT
+和每连接一次固定开销，适合对象存储在同一机架/同可用区的场景；跨公网 S3 时把
+对象数放大 10 倍，延迟也会照着放大。

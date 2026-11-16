@@ -251,9 +251,16 @@ fn newUuid(a: std.mem.Allocator) ![]u8 {
     });
 }
 
+fn profileEnabled() bool {
+    return c.getenv("ZSTORE_PROFILE") != null;
+}
+
 fn openZStore(fs: [*c]c.svn_fs_t, path: [*c]const u8, scratch_pool: ?*c.apr_pool_t) [*c]c.svn_error_t {
     _ = scratch_pool;
     const db_path = std.mem.span(path);
+    const t_start = c.apr_time_now();
+    const prof = profileEnabled();
+    var t_mark = t_start;
     // The loader does not populate fs->path; several svnadmin commands
     // (verify, recover, hotcopy) read it back and would dereference NULL.
     fs.*.path = @constCast(dupFromPool(fs.*.pool, db_path).ptr);
@@ -286,13 +293,23 @@ fn openZStore(fs: [*c]c.svn_fs_t, path: [*c]const u8, scratch_pool: ?*c.apr_pool
     fs.*.vtable = backend.fsVtable();
     if (std.mem.startsWith(u8, prefix, "@")) {} else {}
     fs.*.uuid = zs.uuid.ptr;
+    if (prof) {
+        logf("profile: conf+client {d} ms", .{@divTrunc(c.apr_time_now() - t_mark, 1000)});
+        t_mark = c.apr_time_now();
+    }
 
     // make sure the object-store layout exists
+    if (prof) {
+        logf("profile: open total before layout {d} ms", .{@divTrunc(c.apr_time_now() - t_start, 1000)});
+    }
     store.ensureLayout(&zs.client) catch |e| {
         logf("cannot reach object store at {s}/{s}: {s}", .{ conf.endpoint, conf.bucket, @errorName(e) });
         return err(c.SVN_ERR_FS_GENERAL, "cannot reach object store {s}/{s}", .{ conf.endpoint, conf.bucket });
     };
 
+    if (prof) {
+        logf("profile: ensureLayout {d} ms, total {d} ms", .{ @divTrunc(c.apr_time_now() - t_mark, 1000), @divTrunc(c.apr_time_now() - t_start, 1000) });
+    }
     return noError();
 }
 
