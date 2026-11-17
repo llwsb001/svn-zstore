@@ -31,13 +31,24 @@ pub const Config = struct {
     secret_key: []const u8 = "zstore",
     /// Key prefix inside the bucket, usually the repository uuid.
     prefix: []const u8 = "",
-    insecure_tls: bool = true,
+    /// TLS is verified by default; set `verify_tls = 0` in zstore.conf only for
+    /// a throwaway endpoint with a self-signed certificate.
+    insecure_tls: bool = false,
+    /// Optional CA bundle (PEM) for a private/self-signed S3 endpoint.
+    ca_file: []const u8 = "",
+};
+
+const Hdr = struct {
+    name: []const u8,
+    val: []const u8,
+    fn lessThan(_: void, l: Hdr, r: Hdr) bool {
+        return std.mem.lessThan(u8, l.name, r.name);
+    }
 };
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-const SignedHeaders = "host;x-amz-content-sha256;x-amz-date";
 
 extern "c" fn time(t: ?*i64) i64;
 
@@ -302,30 +313,30 @@ pub const Client = struct {
         const now = std.time.epoch.EpochSeconds{ .secs = @intCast(nowSecs()) };
         const stamp = amzStamp(now);
 
-        // Conditional / copy headers are part of the request, so they must
-        // also be signed: RustFS (like AWS) rejects unsigned headers.
-        var ch = std.ArrayList(u8).empty;
-        defer ch.deinit(a);
-        try ch.appendSlice(a, try std.fmt.allocPrint(a, "host:{s}\n", .{host}));
-        try ch.appendSlice(a, try std.fmt.allocPrint(a, "x-amz-content-sha256:{s}\n", .{&payload_hex}));
-        try ch.appendSlice(a, try std.fmt.allocPrint(a, "x-amz-date:{s}\n", .{&stamp.full}));
-        var names = std.ArrayList(u8).empty;
-        defer names.deinit(a);
-        try names.appendSlice(a, SignedHeaders);
+        // Every header we send (host, payload hash, date, conditional and copy
+        // headers) is signed.  SigV4 requires the canonical header block and
+        // the SignedHeaders list to be sorted by lowercase header name.
+        var hs: std.ArrayList(Hdr) = .empty;
+        defer hs.deinit(a);
+        try hs.append(a, .{ .name = "host", .val = host });
+        try hs.append(a, .{ .name = "x-amz-content-sha256", .val = payload_hex[0..] });
+        try hs.append(a, .{ .name = "x-amz-date", .val = stamp.full[0..] });
         switch (opts.cond) {
             .none => {},
-            .if_absent => {
-                try ch.appendSlice(a, "if-none-match:*\n");
-                try names.appendSlice(a, ";if-none-match");
-            },
-            .if_match => |e| {
-                try ch.appendSlice(a, try std.fmt.allocPrint(a, "if-match:\"{s}\"\n", .{e}));
-                try names.appendSlice(a, ";if-match");
-            },
+            .if_absent => try hs.append(a, .{ .name = "if-none-match", .val = "*" }),
+            .if_match => |e| try hs.append(a, .{ .name = "if-match", .val = try std.fmt.allocPrint(a, "\"{s}\"", .{e}) }),
         }
-        if (opts.copy_source.len > 0) {
-            try ch.appendSlice(a, try std.fmt.allocPrint(a, "x-amz-copy-source:{s}\n", .{opts.copy_source}));
-            try names.appendSlice(a, ";x-amz-copy-source");
+        if (opts.copy_source.len > 0) try hs.append(a, .{ .name = "x-amz-copy-source", .val = opts.copy_source });
+        std.mem.sort(Hdr, hs.items, {}, Hdr.lessThan);
+
+        var ch = std.ArrayList(u8).empty;
+        defer ch.deinit(a);
+        var names = std.ArrayList(u8).empty;
+        defer names.deinit(a);
+        for (hs.items, 0..) |h, i| {
+            try ch.appendSlice(a, try std.fmt.allocPrint(a, "{s}:{s}\n", .{ h.name, h.val }));
+            if (i > 0) try names.append(a, ';');
+            try names.appendSlice(a, h.name);
         }
         const canonical_headers = ch.items;
         const signed_headers = names.items;
@@ -413,6 +424,8 @@ pub const Client = struct {
         if (self.cfg.insecure_tls) {
             _ = cu.curl_easy_setopt(self.curl, cu.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0));
             _ = cu.curl_easy_setopt(self.curl, cu.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0));
+        } else if (self.cfg.ca_file.len > 0) {
+            _ = cu.curl_easy_setopt(self.curl, cu.CURLOPT_CAINFO, self.cfg.ca_file.ptr);
         }
 
         // The handle is reused for every request, so clear the method- and

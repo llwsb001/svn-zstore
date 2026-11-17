@@ -36,6 +36,10 @@ pub const ZStore = struct {
     client: s3.Client,
     uuid: []const u8,
     repo_path: []const u8,
+    /// owner svn_fs_t, needed to build revision roots from rClosestCopy
+    fs: [*c]c.svn_fs_t = null,
+    /// per-session access context; carries the lock tokens the caller holds
+    access_ctx: [*c]c.svn_fs_access_t = null,
     /// process-local cache of the youngest revision (-1 = not loaded yet)
     youngest: i64 = -1,
 
@@ -152,6 +156,8 @@ const RepoConf = struct {
     access_key: []const u8 = "zstore",
     secret_key: []const u8 = "zstore",
     prefix: []const u8 = "",
+    verify_tls: bool = true,
+    ca_file: []const u8 = "",
 };
 
 fn defaultConfText() []const u8 {
@@ -210,6 +216,7 @@ fn loadConf(a: std.mem.Allocator, db_path: []const u8) !RepoConf {
         .access_key = envOr("ACCESS_KEY", "zstore"),
         .secret_key = envOr("SECRET_KEY", "zstore"),
         .prefix = envOr("PREFIX", ""),
+        .verify_tls = true,
     };
     _ = a;
     const path = try joinPath(gpa, &.{ db_path, "zstore.conf" });
@@ -230,6 +237,8 @@ fn loadConf(a: std.mem.Allocator, db_path: []const u8) !RepoConf {
         if (std.mem.eql(u8, key, "access_key")) conf.access_key = val;
         if (std.mem.eql(u8, key, "secret_key")) conf.secret_key = val;
         if (std.mem.eql(u8, key, "prefix")) conf.prefix = val;
+        if (std.mem.eql(u8, key, "verify_tls")) conf.verify_tls = !std.mem.eql(u8, val, "0") and !std.ascii.eqlIgnoreCase(val, "false");
+        if (std.mem.eql(u8, key, "ca_file")) conf.ca_file = val;
     }
     return conf;
 }
@@ -284,8 +293,12 @@ fn openZStore(fs: [*c]c.svn_fs_t, path: [*c]const u8, scratch_pool: ?*c.apr_pool
             .access_key = conf.access_key,
             .secret_key = conf.secret_key,
             .prefix = prefix,
+            .insecure_tls = !conf.verify_tls,
+            .ca_file = conf.ca_file,
         }) catch return err(c.SVN_ERR_FS_GENERAL, "cannot initialise S3 client", .{}),
         .uuid = dupFromPool(fs.*.pool, prefix),
+        .fs = fs,
+        .access_ctx = fs.*.access_ctx,
         .repo_path = dupFromPool(fs.*.pool, db_path),
         .youngest = -1,
     };
@@ -469,6 +482,8 @@ fn repoClient(db_path: []const u8) !HotRepo {
         .access_key = conf.access_key,
         .secret_key = conf.secret_key,
         .prefix = prefix,
+        .insecure_tls = !conf.verify_tls,
+        .ca_file = conf.ca_file,
     });
     return .{ .client = client, .prefix = prefix };
 }

@@ -226,7 +226,8 @@ fn rev0Key(zs: *ZStore) ![]const u8 {
 }
 
 fn youngestRev(zs: *ZStore) !i64 {
-    if (zs.youngest >= 0) return zs.youngest;
+    // HEAD can move under a long-lived process (svnserve), so the cache is a
+    // hint for callers, never a substitute for reading it.
     const head = try store.loadHead(&zs.client, gpa);
     if (head.rev < 0) {
         const key = try rev0Key(zs);
@@ -332,7 +333,11 @@ fn fChangeRevProp(
     var r = store.loadRev(&zs.client, gpa, rev) catch |e| return mapErr(e, "cannot load revision");
     const nm = std.mem.span(name);
     const newval: ?[]const u8 = if (value == null) null else value.*.data[0..value.*.len];
-    const props = propsSet(gpa, r.props, nm, newval) catch |e| return mapErr(e, "cannot update revprops");
+    // Revision records store revprops as a blob key, so decode the blob first;
+    // treating the key as a property list corrupts the record.
+    const old = revPropsBytes(zs, r) catch |e| return mapErr(e, "cannot load revision properties");
+    defer if (r.props.len > 0) gpa.free(old);
+    const props = propsSet(gpa, old, nm, newval) catch |e| return mapErr(e, "cannot update revprops");
     defer gpa.free(props);
     const blob = store.putBlob(&zs.client, gpa, props) catch |e| return mapErr(e, "cannot store revprops");
     r.props = blob;
@@ -485,8 +490,12 @@ fn fListTransactions(names_p: [*c][*c]c.apr_array_header_t, fs_: [*c]c.svn_fs_t,
         gpa.free(ids);
     }
     names_p.* = c.apr_array_make(pool, @intCast(ids.len), @sizeOf([*c]const u8));
-    const elts: [*][*c]const u8 = @ptrCast(@alignCast(names_p.*.*.elts));
-    for (ids, 0..) |id, i| elts[i] = fs.dupFromPool(pool, id).ptr;
+    for (ids) |id| {
+        // apr_array_make only reserves space; nelts has to advance per element
+        // or svnadmin lstxns sees an empty array.
+        const slot: [*][*c]const u8 = @ptrCast(@alignCast(c.apr_array_push(names_p.*)));
+        slot[0] = fs.dupFromPool(pool, id).ptr;
+    }
     return noError();
 }
 
@@ -515,6 +524,47 @@ fn lockToSvn(rec: store.LockRec, pool: ?*c.apr_pool_t) [*c]c.svn_lock_t {
 
 /// Locks carry an optional expiration; an expired lock no longer protects the
 /// path, so callers must be able to take it over without --steal.
+extern fn svn_fs__access_get_lock_tokens(access_ctx: ?*c.svn_fs_access_t) ?*c.apr_hash_t;
+
+fn lockTokenHeld(zs: *ZStore, token: []const u8) bool {
+    const access = zs.access_ctx orelse return false;
+    const ht = svn_fs__access_get_lock_tokens(access) orelse return false;
+    return c.apr_hash_get(ht, token.ptr, @intCast(token.len)) != null;
+}
+
+fn pathUnder(prefix: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    return path.len > prefix.len and path[prefix.len] == '/';
+}
+
+/// Mirrors libsvn_fs_fs' verify_locks(): a changed path may only be committed
+/// by the session that holds its lock.  Adds and deletes additionally need the
+/// locks on every child of the path.
+fn lockConflict(zs: *ZStore, changes: []const Change) !?[]const u8 {
+    const locks = try store.listLocks(&zs.client, gpa);
+    defer {
+        for (locks) |l| {
+            if (l.path.len > 0) gpa.free(l.path);
+            if (l.token.len > 0) gpa.free(l.token);
+            if (l.owner.len > 0) gpa.free(l.owner);
+            if (l.comment.len > 0) gpa.free(l.comment);
+        }
+        gpa.free(locks);
+    }
+    const now = c.apr_time_now();
+    for (changes) |ch| {
+        const recurse = ch.kind != c.svn_fs_path_change_modify;
+        for (locks) |l| {
+            if (lockExpired(l, now)) continue;
+            const hit = std.mem.eql(u8, l.path, ch.path) or (recurse and pathUnder(ch.path, l.path));
+            if (!hit) continue;
+            if (lockTokenHeld(zs, l.token)) continue;
+            return try gpa.dupe(u8, l.path);
+        }
+    }
+    return null;
+}
+
 fn lockExpired(rec: store.LockRec, now: i64) bool {
     return rec.expires > 0 and rec.expires < now;
 }
@@ -1016,6 +1066,18 @@ fn tCommit(
     const root_tree = treeAt(&ctx, "/") catch |e| return mapErr(e, "cannot read txn root");
     const root_key = flushDir(&ctx, "/", root_tree) catch |e| return mapErr(e, "cannot flush trees to the object store");
 
+    // Lock enforcement: svnserve and mod_dav_svn rely on the FS layer to reject
+    // commits that touch a path locked by a different session.
+    var lc_list = collectChangePaths(&ctx, t.base_rev) catch null;
+    if (lc_list) |*locked_changes| {
+        defer freeChanges(locked_changes);
+        const locked = lockConflict(zs, locked_changes.items) catch |e| return mapErr(e, "cannot verify locks");
+        if (locked) |lp| {
+            defer gpa.free(lp);
+            return err(c.SVN_ERR_FS_PATH_ALREADY_LOCKED, "path '{s}' is locked", .{lp});
+        }
+    }
+
     // FSFS stamps svn:date here if the caller did not supply one; do the same so
     // that `svn log` shows a real date instead of "(no date)".
     if (store.propGet(t.props, "svn:date") == null) {
@@ -1039,38 +1101,31 @@ fn tCommit(
     var committed: i64 = -1;
     var commit_root: []const u8 = root_key;
     while (attempt < 32) : (attempt += 1) {
+        const hw = store.headWithEtag(&zs.client, gpa) catch |e| return mapErr(e, "cannot read HEAD");
         var head_rev: i64 = -1;
+        var head_root: []const u8 = "";
         var head_etag: ?[]u8 = null;
-        if (store.headWithEtag(&zs.client, gpa) catch |e| return mapErr(e, "cannot read HEAD")) |hw| {
-            head_rev = hw.head.rev;
-            head_etag = hw.etag;
+        if (hw) |h| {
+            head_rev = h.head.rev;
+            head_root = h.head.root;
+            head_etag = h.etag;
         }
         defer if (head_etag) |e| gpa.free(e);
-        // Refuse to build a revision on a base that is no longer HEAD: without
-        // a three-way merge that would silently drop the winner's changes.
-        if (t.base_rev != head_rev) {
-            return err(c.SVN_ERR_FS_TXN_OUT_OF_DATE, "transaction base r{d} is out of date (HEAD is r{d})", .{ t.base_rev, head_rev });
-        }
+        defer if (head_root.len > 0) gpa.free(head_root);
         const new_rev = head_rev + 1;
 
-        // Replay our changes on top of the current HEAD when it moved while
-        // the transaction was open, so disjoint concurrent commits merge
-        // instead of losing or rejecting each other's work.
-        var head_root: []const u8 = "";
+        // HEAD moved while the transaction was open: replay our changes on
+        // top of it so disjoint concurrent commits merge instead of silently
+        // dropping the winner's changes or rejecting ours.
         if (t.base_rev != head_rev) {
-            const lookup = store.headWithEtag(&zs.client, gpa) catch return err(c.SVN_ERR_FS_GENERAL, "cannot read HEAD", .{});
-            defer if (lookup) |hw| {
-                if (hw.etag) |e| gpa.free(e);
-                gpa.free(hw.head.root);
-            };
-            if (lookup) |hw| head_root = hw.head.root;
             if (head_root.len == 0) return err(c.SVN_ERR_FS_GENERAL, "cannot read HEAD root", .{});
             commit_root = rebaseOntoTxnHead(t, head_rev, head_root) catch |e| switch (e) {
                 error.Conflict => return err(c.SVN_ERR_FS_TXN_OUT_OF_DATE, "transaction base r{d} is out of date (HEAD is r{d})", .{ t.base_rev, head_rev }),
                 else => return mapErr(e, "cannot rebase transaction onto HEAD"),
             };
-        }
-        if (t.base_rev == head_rev) {
+        } else {
+            // created_rev must name the revision that last touched a node or
+            // libsvn_repos' check_out_of_date() cannot see stale commits.
             var stamp_ctx = Ctx{
                 .zs = t.zs,
                 .rev = t.base_rev,
@@ -1093,13 +1148,24 @@ fn tCommit(
         const rev_cond: s3.Cond = .if_absent;
         const rev_etag: ?[]u8 = store.putRevCond(&zs.client, gpa, .{
             .rev = new_rev,
-            .parent = t.base_rev,
+            .parent = head_rev,
             .root = commit_root,
             .props = props_key,
         }, rev_cond) catch |e| switch (e) {
             // Another writer already published this revision number; just
             // retry from the freshly read HEAD.
-            error.Precondition => continue,
+            error.Precondition => {
+                // Another writer published this number, or a crashed one left
+                // the record behind.  After a couple of rounds the record is
+                // provably stale (HEAD still points at our base), so reclaim
+                // it instead of looping until the attempt budget runs out.
+                if (attempt >= 2) {
+                    const orphan = std.fmt.allocPrint(gpa, "revs/{d}", .{new_rev}) catch "";
+                    defer if (orphan.len > 0) gpa.free(orphan);
+                    if (orphan.len > 0) zs.client.delete(orphan) catch {};
+                }
+                continue;
+            },
             else => return mapErr(e, "cannot write revision record"),
         };
         if (rev_etag) |etag| gpa.free(etag);
@@ -1358,8 +1424,9 @@ fn rClosestCopy(
     while (norm.len > 1) {
         if (entryAt(ctx, norm) catch null) |e| {
             if (e.copyfrom_rev >= 0 and e.copyfrom_path.len > 0) {
-                path_p.* = fs.dupFromPool(pool, norm).ptr;
-                return noError();
+                const src_key = rootKeyForRev(ctx.zs, e.copyfrom_rev) catch |err2| return mapErr(err2, "cannot read copy source revision");
+                path_p.* = fs.dupFromPool(pool, e.copyfrom_path).ptr;
+                return makeRoot(root_p, ctx.zs.fs, e.copyfrom_rev, null, src_key, pool);
             }
         }
         const parent = parentOf(norm);
@@ -2389,7 +2456,10 @@ fn rPathsChanged(changed_paths_p: [*c]?*c.apr_hash_t, root: [*c]c.svn_fs_root_t,
             .copyfrom_path = if (ch.copyfrom_path.len > 0) ch.copyfrom_path.ptr else null,
             .mergeinfo_mod = c.svn_tristate_unknown,
         };
-        c.apr_hash_set(ht, ch.path.ptr, @intCast(ch.path.len), pc);
+        // The Change list owns ch.path and is freed on return, so the hash key
+        // needs a copy that lives as long as the result pool.
+        const key = fs.dupFromPool(pool, ch.path);
+        c.apr_hash_set(ht, key.ptr, @intCast(key.len), pc);
     }
     changed_paths_p.* = ht;
     return noError();
